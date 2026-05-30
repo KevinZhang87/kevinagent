@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+*.db
+.deps_installed
+
+# Node
+node_modules/
+.next/
+out/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.cert
+
+# Logs
+*.log
+
+# Sandbox workspace
+sandbox_workspace/
+workspaces/
+shared_workspace/
+
+# Sensitive config overrides (keep .yaml.example files)
+backend/config/app.local.yaml
+backend/config/providers.local.yaml
+
+# Uploads and temp files
+backend/uploads/
+backend/temp/

@@ -1,0 +1,15 @@
+apiVersion: v2
+name: kevin-agent
+description: Self-evolving AI Agent Framework
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+
+keywords:
+  - ai
+  - agent
+  - llm
+  - self-evolving
+
+maintainers:
+  - name: KevinAgent

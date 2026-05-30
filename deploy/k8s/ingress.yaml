@@ -1,0 +1,41 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kevin-agent
+  namespace: kevin-agent
+  labels:
+    app.kubernetes.io/name: kevin-agent
+  annotations:
+    # Nginx Ingress Controller
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    # WebSocket support
+    nginx.ingress.kubernetes.io/websocket-services: "kevin-backend"
+    # Uncomment for TLS
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: kevin.local  # Change to your domain
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: kevin-backend
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kevin-frontend
+                port:
+                  number: 3000
+  # Uncomment for TLS
+  # tls:
+  #   - hosts:
+  #       - kevin.local
+  #     secretName: kevin-tls

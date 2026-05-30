@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kevin-agent
+  labels:
+    app.kubernetes.io/name: kevin-agent
+    app.kubernetes.io/part-of: kevin-agent

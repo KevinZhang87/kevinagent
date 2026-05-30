@@ -1,0 +1,129 @@
+# KevinAgent Helm Chart Values
+
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+
+# ============================================
+# Backend
+# ============================================
+backend:
+  replicaCount: 1
+
+  image:
+    repository: kevin-agent/backend
+    tag: "latest"
+    pullPolicy: Always
+
+  service:
+    type: ClusterIP
+    port: 8000
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    size: 1Gi
+
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8000
+    initialDelaySeconds: 10
+    periodSeconds: 30
+
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 8000
+    initialDelaySeconds: 5
+    periodSeconds: 10
+
+# ============================================
+# Frontend
+# ============================================
+frontend:
+  replicaCount: 1
+
+  image:
+    repository: kevin-agent/frontend
+    tag: "latest"
+    pullPolicy: Always
+
+  service:
+    type: ClusterIP
+    port: 3000
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# ============================================
+# Ingress
+# ============================================
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/websocket-services: "kevin-backend"
+  hosts:
+    - host: kevin.local
+      paths:
+        - path: /api
+          pathType: Prefix
+          serviceName: backend
+        - path: /
+          pathType: Prefix
+          serviceName: frontend
+  tls: []
+
+# ============================================
+# Config
+# ============================================
+config:
+  # App settings
+  host: "0.0.0.0"
+  port: "8000"
+  logLevel: "INFO"
+  # Database: sqlite | mysql | postgresql
+  databaseType: "sqlite"
+  databaseUrl: "sqlite+aiosqlite:///./kevin.db"
+
+  # Default model
+  defaultProvider: "openai"
+  defaultModel: "gpt-4o"
+
+  # Agent settings
+  maxIterations: "30"
+  maxMemoryItems: "100"
+
+# ============================================
+# Secrets (API Keys)
+# ============================================
+secrets:
+  openaiApiKey: ""
+  anthropicApiKey: ""
+  deepseekApiKey: ""
+  moonshotApiKey: ""
+  glmApiKey: ""
+  mimoApiKey: ""
+  # For MySQL/PostgreSQL (uncomment and set)
+  # dbHost: "localhost"
+  # dbPort: "3306"
+  # dbName: "kevin_agent"
+  # dbUser: "root"
+  # dbPassword: ""

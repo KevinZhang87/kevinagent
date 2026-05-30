@@ -1,0 +1,61 @@
+# ============================================
+# KevinAgent - Tool Configuration
+# ============================================
+# Note: blocked_commands and blocked_paths are now enforced
+# by the sandbox layer. See app.yaml for sandbox settings.
+# ============================================
+
+tools:
+  shell:
+    enabled: true
+    timeout: 30
+    max_output: 5000
+    allowed_commands: []  # Empty = all allowed (within sandbox)
+    blocked_commands:
+      - "rm -rf /"
+      - "rm -rf /*"
+      - "mkfs"
+      - "dd if="
+      - "format"
+      - "del /s /q C:\\"
+      - ":(){ :|:& };:"
+      - "shutdown"
+      - "reboot"
+
+  file_read:
+    enabled: true
+    max_size: 50000  # bytes
+    allowed_extensions: []  # Empty = all allowed (within sandbox)
+
+  file_write:
+    enabled: true
+    max_size: 100000  # bytes
+    blocked_paths:
+      - "/etc"
+      - "/sys"
+      - "/proc"
+      - "C:\\Windows"
+
+  web_search:
+    enabled: true
+    timeout: 10
+    max_results: 5
+
+  python_exec:
+    enabled: true
+    timeout: 30
+    max_output: 5000
+    # Dangerous modules blocked in local sandbox:
+    # os.system, subprocess, shutil.rmtree, __import__
+
+  memory_save:
+    enabled: true
+    max_importance: 1.0
+
+# Skill auto-creation settings
+skills:
+  auto_create: true
+  min_tool_calls: 2  # Minimum tool calls to consider creating a skill
+  min_messages: 4    # Minimum messages to consider creating a skill
+  auto_evolve: true
+  evolve_threshold: 3  # Evolve skills with more than N failures

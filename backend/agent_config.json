@@ -1,0 +1,10 @@
+{
+  "agents": {
+    "牛马3号": {
+      "model": "mimo",
+      "description": "专门负责Excel数据处理的智能体",
+      "tools": ["excel_tool"],
+      "capabilities": ["数据读取", "数据分析", "图表生成", "报告编写"]
+    }
+  }
+}
