@@ -46,7 +46,7 @@ export default function MemoryPage() {
   const [confirmDelete, setConfirmDelete] = useState<number | null>(null);
   const [cleaningUp, setCleaningUp] = useState(false);
   const [cleanupResult, setCleanupResult] = useState<string>("");
-  const [cleanupDryRun, setCleanupDryRun] = useState(true);
+  const [cleanupDryRun, setCleanupDryRun] = useState(false);
   const [cleanupMaxAge, setCleanupMaxAge] = useState(30);
   const [cleanupMinImportance, setCleanupMinImportance] = useState(0.3);
   const [maintenanceInfo, setMaintenanceInfo] = useState({

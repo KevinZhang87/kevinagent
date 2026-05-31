@@ -7,7 +7,7 @@ from sqlalchemy import select, desc
 from app.models.database import Skill, Message, async_session
 from app.llm.registry import get_provider
 from app.llm.base import LLMMessage
-from app.config import default_provider, default_model
+import app.config as cfg
 
 logger = logging.getLogger("kevin_agent.skills.manager")
 
@@ -172,7 +172,14 @@ class SkillManager:
 
             return True
 
-    async def record_usage(self, name: str, success: bool):
+    async def record_usage(self, name: str, success: bool, context: dict = None):
+        """Record skill usage, optionally storing failure context for evolution.
+
+        Args:
+            name: Skill name
+            success: Whether the skill was used successfully
+            context: Optional dict with 'user_query', 'skill_output', 'error' for failure analysis
+        """
         async with async_session() as session:
             result = await session.execute(
                 select(Skill).where(Skill.name == name)
@@ -183,10 +190,31 @@ class SkillManager:
                     skill.success_count += 1
                 else:
                     skill.fail_count += 1
+                    # Store failure context for future evolution
+                    if context:
+                        import json as _json
+                        notes = []
+                        if skill.failure_notes:
+                            try:
+                                notes = _json.loads(skill.failure_notes)
+                            except Exception:
+                                notes = []
+                        # Keep last 10 failure entries, each capped at 300 chars
+                        entry = {
+                            "q": (context.get("user_query") or "")[:300],
+                            "o": (context.get("skill_output") or "")[:300],
+                            "e": (context.get("error") or "")[:200],
+                        }
+                        notes.append(entry)
+                        skill.failure_notes = _json.dumps(notes[-10:], ensure_ascii=False)
                 await session.commit()
 
     async def try_create_from_conversation(self, session_id: str, response: str):
         """Try to create a skill from a complex conversation."""
+        # Check if auto-creation is enabled
+        if not cfg.tools_config.skills.auto_create:
+            return
+
         async with async_session() as session:
             # Get recent messages
             result = await session.execute(
@@ -197,12 +225,12 @@ class SkillManager:
             )
             messages = list(result.scalars())
 
-            if len(messages) < 4:
+            if len(messages) < cfg.tools_config.skills.min_messages:
                 return  # Too short to be a skill
 
             # Count tool calls
             tool_count = sum(1 for m in messages if m.role == "tool")
-            if tool_count < 2:
+            if tool_count < cfg.tools_config.skills.min_tool_calls:
                 return  # Not complex enough
 
             # Use LLM to summarize as a skill
@@ -211,8 +239,8 @@ class SkillManager:
             )
 
             try:
-                provider = default_provider
-                model = default_model
+                provider = cfg.default_provider
+                model = cfg.default_model
                 llm = get_provider(provider, model)
                 logger.info("Attempting to create skill from conversation: session=%s", session_id[:8])
                 summary_response = await llm.chat([
@@ -249,11 +277,15 @@ Only create a skill if the conversation shows a clear, reusable pattern. If not,
             except Exception as e:
                 logger.warning("Skill creation error: %s", e)
 
-    async def get_skill_context(self, query: str) -> str:
-        """Get relevant skills as context for the agent."""
+    async def get_skill_context(self, query: str) -> tuple[str, list[str]]:
+        """Get relevant skills as context for the agent.
+
+        Returns:
+            (context_string, list_of_matched_skill_names)
+        """
         skills = await self.list_skills()
         if not skills:
-            return ""
+            return "", []
 
         # Simple keyword matching for relevance
         relevant = []
@@ -267,7 +299,8 @@ Only create a skill if the conversation shows a clear, reusable pattern. If not,
             # Return top skills by success rate
             relevant = sorted(skills, key=lambda s: s["success_count"], reverse=True)[:3]
 
+        matched_names = [s["name"] for s in relevant[:5]]
         context = "\n\nRelevant skills:\n"
         for s in relevant[:5]:
             context += f"- {s['name']}: {s['description']}\n  Instruction: {s['instruction'][:200]}\n"
-        return context
+        return context, matched_names

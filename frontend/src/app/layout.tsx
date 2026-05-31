@@ -15,7 +15,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <AppProvider>
           <div style={{ display: "flex", height: "100vh", overflow: "hidden" }}>
             <Sidebar />
-            <main style={{ flex: 1, overflow: "hidden" }}>{children}</main>
+            <main style={{ flex: 1, overflow: "hidden", overflowY: "auto" }}>{children}</main>
           </div>
         </AppProvider>
       </body>

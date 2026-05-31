@@ -8,81 +8,44 @@ server:
 database:
   type: sqlite
   sqlite_path: ./kevin.db
-  # For MySQL/PostgreSQL, set credentials via environment variables:
-  # DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, DATABASE_URL
   pool_size: 5
   max_overflow: 10
   echo: false
 agent:
   max_iterations: 30
   max_memory_items: 100
-  system_prompt: 'You are KevinAgent, an intelligent and self-evolving AI assistant.
-    You can:
-
-    1. Use tools to accomplish tasks (shell commands, file operations, web search,
-    code execution)
-
-    2. Remember important information across conversations
-
-    3. Learn from experience and improve your skills over time
-
-    4. Collaborate with other agents for complex tasks
-
-
-    When you complete a complex task successfully, consider saving it as a skill for
-    future use.
-
-    Always think step by step and use tools when needed. Be helpful, accurate, and
-    proactive.
-
-    '
 active_providers:
-- openai
-
-# ============================================
-# Sandbox Configuration
-# Controls how agent code/commands are executed
-# ============================================
+- deepseek
+- mimo
 sandbox:
-  # Enable sandbox isolation for agent tool execution
   enabled: true
-  # Backend: "auto" (try Docker → local), "docker", "local", "disabled"
   backend: auto
-  # Workspace directory for file operations (mounted into Docker container)
   workspace: ./sandbox_workspace
-  # Docker image for container-based sandbox
   docker_image: python:3.11-slim
-  # Resource limits per execution
   memory_limit: 512m
   cpu_limit: 1.0
   timeout: 60
-  # Disable network access inside sandbox
   network_disabled: false
-  # Max file size for read/write operations (bytes)
   max_file_size: 100000
-  # Paths that are read-only inside sandbox
   readonly_paths:
-    - /etc
-    - /sys
-    - /proc
-    - C:\Windows
-  # Paths that are completely blocked
+  - /etc
+  - /sys
+  - /proc
+  - C:\Windows
   blocked_paths:
-    - /etc/shadow
-    - /etc/passwd
-    - C:\Windows\System32
-  # Commands that are always blocked
+  - /etc/shadow
+  - /etc/passwd
+  - C:\Windows\System32
   blocked_commands:
-    - rm -rf /
-    - rm -rf /*
-    - mkfs
-    - dd if=
-    - format
-    - del /s /q C:\
-    - ":(){ :|:& };:"
-    - shutdown
-    - reboot
-
+  - rm -rf /
+  - rm -rf /*
+  - mkfs
+  - dd if=
+  - format
+  - del /s /q C:\
+  - ':(){ :|:& };:'
+  - shutdown
+  - reboot
 logging:
   level: INFO
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

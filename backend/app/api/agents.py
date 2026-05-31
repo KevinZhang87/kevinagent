@@ -203,11 +203,27 @@ async def delete_agent(agent_id: str):
     # Remove from in-memory dict
     agent_manager._agents.pop(agent_id, None)
 
-    # Also remove from database
+    # Remove from database
     from sqlalchemy import delete as sql_delete
+    from app.models.database import Message, Memory, Skill
     async with async_session() as session:
         await session.execute(sql_delete(AgentState).where(AgentState.agent_id == agent_id))
+        # Also clean up messages and memories associated with this agent
+        await session.execute(sql_delete(Message).where(Message.agent_id == agent_id))
+        await session.execute(sql_delete(Memory).where(Memory.session_id.like(f"%{agent_id}%")))
         await session.commit()
+
+    # Clean up agent workspace directory
+    import shutil
+    from pathlib import Path
+    workspaces_dir = Path(__file__).parent.parent.parent / "workspaces"
+    agent_workspace = workspaces_dir / agent_id
+    if agent_workspace.exists():
+        try:
+            shutil.rmtree(agent_workspace)
+            logger.info("Agent workspace deleted: %s", agent_workspace)
+        except Exception as e:
+            logger.warning("Failed to delete agent workspace %s: %s", agent_workspace, e)
 
     logger.info("Agent deleted: %s", agent_id)
     return {"status": "deleted"}

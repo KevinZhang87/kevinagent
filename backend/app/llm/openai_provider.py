@@ -1,6 +1,6 @@
 from typing import AsyncIterator
 from openai import AsyncOpenAI
-from .base import BaseLLMProvider, LLMMessage, LLMResponse, LLMStreamChunk
+from .base import BaseLLMProvider, LLMMessage, LLMResponse, LLMStreamChunk, cleanup_tool_call_messages
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -14,30 +14,47 @@ class OpenAIProvider(BaseLLMProvider):
         )
 
     def _format_messages(self, messages: list[LLMMessage]) -> list[dict]:
-        """Format LLMMessage list to OpenAI API message format."""
-        formatted = []
+        """Format LLMMessage list to OpenAI API message format.
+
+        DeepSeek, MiMo, Moonshot, GLM and other strict providers require:
+        - tool messages must follow an assistant message with tool_calls
+        - ALL tool_calls must have corresponding tool messages
+        - orphan tool messages are dropped
+
+        Note: tool_calls in DB are stored as [{"id", "name", "arguments"}]
+        but OpenAI API expects [{"id", "type", "function": {"name", "arguments"}}]
+        """
+        # First: clean up incomplete tool-call sequences (shared across all providers)
+        messages = cleanup_tool_call_messages(messages)
+
+        # Then: convert to OpenAI API format
+        raw_formatted = []
         for m in messages:
             msg = {"role": m.role}
             if m.role == "assistant" and m.tool_calls:
                 msg["content"] = m.content or None
-                msg["tool_calls"] = [
-                    {
-                        "id": tc.get("id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": tc.get("name", ""),
-                            "arguments": tc.get("arguments", "{}"),
-                        },
-                    }
-                    for tc in m.tool_calls
-                ]
+                formatted_tool_calls = []
+                for tc in m.tool_calls:
+                    if "function" in tc:
+                        formatted_tool_calls.append(tc)
+                    else:
+                        formatted_tool_calls.append({
+                            "id": tc.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": tc.get("name", ""),
+                                "arguments": tc.get("arguments", "{}"),
+                            },
+                        })
+                msg["tool_calls"] = formatted_tool_calls
             elif m.role == "tool":
                 msg["content"] = m.content
                 msg["tool_call_id"] = m.tool_call_id
             else:
                 msg["content"] = m.content
-            formatted.append(msg)
-        return formatted
+            raw_formatted.append(msg)
+
+        return raw_formatted
 
     async def chat(self, messages: list[LLMMessage], tools: list[dict] = None) -> LLMResponse:
         kwargs = {

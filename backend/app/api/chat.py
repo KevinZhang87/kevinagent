@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.models.schemas import ChatRequest, StreamChunk
+from app.models.database import async_session, Message as MessageModel
 from app.core.agent import agent_manager
 from app.core.memory import MemoryManager
 from app.websocket.handler import ws_manager
@@ -24,15 +25,15 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 class SessionCreateRequest(BaseModel):
     title: str = "New Chat"
-    provider: str = "openai"
-    model: str = "gpt-4o"
+    provider: str = ""
+    model: str = ""
 
 
 class ChatWithAttachmentsRequest(BaseModel):
     message: str
     session_id: str
-    model: str = "gpt-4o"
-    provider: str = "openai"
+    model: str = ""
+    provider: str = ""
     attachments: list[dict] = []  # [{type, name, content, mime_type}]
 
 
@@ -71,14 +72,15 @@ async def chat(request: ChatRequest):
             else:
                 raise HTTPException(status_code=404, detail=f"Agent '{target_agent_id}' not found")
     else:
-        # Update agent model if changed
-        if agent.provider_name != request.provider or agent.model != request.model:
+        # Determine effective provider/model: use request values if provided, else keep current
+        from app.llm.registry import get_provider
+        effective_provider = request.provider or agent.provider_name
+        effective_model = request.model or agent.model
+        if agent.provider_name != effective_provider or agent.model != effective_model:
             logger.info("Agent model updated: %s/%s -> %s/%s",
-                        agent.provider_name, agent.model, request.provider, request.model)
-            from app.llm.registry import get_provider
-            agent.provider_name = request.provider
-            agent.model = request.model
-            agent.llm = get_provider(request.provider, request.model)
+                        agent.provider_name, agent.model, effective_provider, effective_model)
+            agent.provider_name = effective_provider
+            agent.model = effective_model
             # Sync to DB so workflow/list_agents reflect the change
             try:
                 from app.models.database import AgentState, async_session
@@ -86,12 +88,14 @@ async def chat(request: ChatRequest):
                 async with async_session() as db_session:
                     await db_session.execute(
                         sql_update(AgentState).where(AgentState.agent_id == target_agent_id).values(
-                            provider=request.provider, model=request.model
+                            provider=effective_provider, model=effective_model
                         )
                     )
                     await db_session.commit()
             except Exception as e:
                 logger.warning("Failed to sync agent config to DB: %s", e)
+        # Always rebuild LLM provider to pick up latest API key from cfg.providers_config
+        agent.llm = get_provider(effective_provider, effective_model)
 
     async def event_stream():
         try:
@@ -111,8 +115,8 @@ async def chat(request: ChatRequest):
 async def chat_with_upload(
     message: str = Form(""),
     session_id: str = Form(""),
-    provider: str = Form("openai"),
-    model: str = Form("gpt-4o"),
+    provider: str = Form(""),
+    model: str = Form(""),
     agent_id: str = Form(""),
     files: list[UploadFile] = File(default=[]),
 ):
@@ -192,11 +196,13 @@ async def chat_with_upload(
             else:
                 raise HTTPException(status_code=404, detail=f"Agent '{target_agent_id}' not found")
     else:
-        if agent.provider_name != provider or agent.model != model:
-            from app.llm.registry import get_provider
-            agent.provider_name = provider
-            agent.model = model
-            agent.llm = get_provider(provider, model)
+        from app.llm.registry import get_provider
+        effective_provider = provider or agent.provider_name
+        effective_model = model or agent.model
+        if agent.provider_name != effective_provider or agent.model != effective_model:
+            agent.provider_name = effective_provider
+            agent.model = effective_model
+            agent.llm = get_provider(effective_provider, effective_model)
             # Sync to DB so workflow/list_agents reflect the change
             try:
                 from app.models.database import AgentState, async_session
@@ -204,7 +210,7 @@ async def chat_with_upload(
                 async with async_session() as db_session:
                     await db_session.execute(
                         sql_update(AgentState).where(AgentState.agent_id == target_agent_id).values(
-                            provider=provider, model=model
+                            provider=effective_provider, model=effective_model
                         )
                     )
                     await db_session.commit()
@@ -317,10 +323,49 @@ async def list_sessions():
 
 
 @router.get("/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str, limit: int = 100):
-    """Get messages for a specific session."""
-    memory = MemoryManager(session_id)
-    messages = await memory.get_conversation_messages(session_id, limit)
+async def get_session_messages(session_id: str, limit: int = 100, include_children: bool = True):
+    """Get messages for a specific session, optionally including child agent messages."""
+    from sqlalchemy import select, or_
+
+    async with async_session() as session:
+        if include_children:
+            # Get messages from parent session AND all child sessions
+            # Child sessions are named: child_{agent_id}_{parent_prefix}_{uuid}
+            # where parent_prefix is the first 8 chars of parent session_id
+            parent_prefix = session_id[:8]
+            stmt = (
+                select(MessageModel)
+                .where(
+                    or_(
+                        MessageModel.session_id == session_id,
+                        MessageModel.session_id.like(f"child_%_{parent_prefix}_%"),
+                    )
+                )
+                .order_by(MessageModel.id)
+                .limit(limit)
+            )
+        else:
+            stmt = (
+                select(MessageModel)
+                .where(MessageModel.session_id == session_id)
+                .order_by(MessageModel.id)
+                .limit(limit)
+            )
+
+        result = await session.execute(stmt)
+        messages = []
+        for msg in result.scalars():
+            messages.append({
+                "id": msg.id,
+                "role": msg.role,
+                "content": msg.content,
+                "tool_calls": json.loads(msg.tool_calls) if msg.tool_calls else None,
+                "tool_call_id": msg.tool_call_id or "",
+                "agent_id": msg.agent_id or "main",
+                "session_id": msg.session_id,
+                "created_at": msg.created_at.isoformat() if msg.created_at else "",
+            })
+
     return {"messages": messages, "session_id": session_id}
 
 

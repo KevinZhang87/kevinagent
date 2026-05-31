@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 from app.sandbox.manager import get_sandbox_manager
+from app.sandbox.cleaner import get_workspace_cleaner
 
 router = APIRouter(prefix="/api/sandbox", tags=["sandbox"])
 
@@ -54,3 +55,18 @@ async def sandbox_test():
             "error": python_result.error,
         },
     }
+
+
+@router.get("/workspaces")
+async def workspace_stats():
+    """Get disk usage stats for all agent workspaces."""
+    cleaner = get_workspace_cleaner()
+    return cleaner.get_workspace_stats()
+
+
+@router.post("/workspaces/cleanup")
+async def workspace_cleanup():
+    """Manually trigger workspace cleanup (TTL + size-based)."""
+    cleaner = get_workspace_cleaner()
+    stats = cleaner.run_once()
+    return stats

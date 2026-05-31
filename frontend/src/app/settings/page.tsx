@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { Check, AlertTriangle, Plus, X, Save, Palette, User, Bot, Brain } from "lucide-react";
 import { fetchProviders, fetchCurrentConfig, saveSettings, addCustomModel, removeCustomModel, fetchUserSettings, updateUserSettings } from "@/lib/api";
+import { useApp } from "@/contexts/AppContext";
 
 interface ModelInfo { id: string; name: string; }
 interface Provider { name: string; id: string; models: ModelInfo[]; is_configured: boolean; }
@@ -34,6 +35,7 @@ const bgOptions = [
 ];
 
 export default function SettingsPage() {
+  const { refreshProviders } = useApp();
   const [allProviders, setAllProviders] = useState<Provider[]>([]);
   const [activeIds, setActiveIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
@@ -47,7 +49,6 @@ export default function SettingsPage() {
   const [maxIterations, setMaxIterations] = useState(30);
   const [showAddMenu, setShowAddMenu] = useState(false);
   const [showAddModel, setShowAddModel] = useState<string | null>(null);
-  const [newModelId, setNewModelId] = useState("");
   const [newModelName, setNewModelName] = useState("");
 
   // User settings
@@ -72,6 +73,9 @@ export default function SettingsPage() {
     setLoading(true);
     setError("");
     try {
+      // Refresh shared context so chat page has latest data
+      await refreshProviders();
+
       const d = await fetchProviders();
       const list: Provider[] = d.providers || [];
       setAllProviders(list);
@@ -151,11 +155,22 @@ export default function SettingsPage() {
     setSaved(false);
     setError("");
     try {
+      // If no provider selected, use the first active provider
+      let finalProvider = defaultProvider;
+      let finalModel = defaultModel;
+
+      if (!finalProvider && activeProviders.length > 0) {
+        finalProvider = activeProviders[0].id;
+        if (activeProviders[0].models.length > 0) {
+          finalModel = activeProviders[0].models[0].id;
+        }
+      }
+
       const data = await saveSettings({
         api_keys: apiKeys,
         base_urls: baseUrls,
-        default_provider: defaultProvider,
-        default_model: defaultModel,
+        default_provider: finalProvider,
+        default_model: finalModel,
         max_iterations: maxIterations,
         active_providers: activeIds,
       });
@@ -179,6 +194,8 @@ export default function SettingsPage() {
         });
         applyTheme(theme);
         applyBackground(background);
+        // Refresh providers in shared context so Chat page picks up changes
+        await refreshProviders();
         setSaved(true);
         setTimeout(() => setSaved(false), 3000);
         await load();
@@ -198,12 +215,14 @@ export default function SettingsPage() {
   };
 
   const handleAddCustomModel = async (providerId: string) => {
-    if (!newModelId.trim()) return;
+    const name = newModelName.trim();
+    if (!name) return;
     try {
-      await addCustomModel(providerId, newModelId.trim(), newModelName.trim() || newModelId.trim());
+      // Model name serves as both id and display name (mainstream approach)
+      await addCustomModel(providerId, name, name);
       setShowAddModel(null);
-      setNewModelId("");
       setNewModelName("");
+      await refreshProviders();
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to add model");
@@ -213,6 +232,7 @@ export default function SettingsPage() {
   const handleRemoveCustomModel = async (providerId: string, modelId: string) => {
     try {
       await removeCustomModel(providerId, modelId);
+      await refreshProviders();
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to remove model");
@@ -299,15 +319,47 @@ export default function SettingsPage() {
             </div>
             <div>
               <label style={{ fontSize: 14, color: "var(--color-text-muted)", display: "block", marginBottom: 10 }}>Default Provider</label>
-              <select value={defaultProvider} onChange={(e) => setDefaultProvider(e.target.value)} style={inputStyle}>
+              <select value={defaultProvider} onChange={(e) => {
+                setDefaultProvider(e.target.value);
+                // Auto-select first model when provider changes
+                const selectedProvider = activeProviders.find(p => p.id === e.target.value);
+                if (selectedProvider && selectedProvider.models.length > 0) {
+                  setDefaultModel(selectedProvider.models[0].id);
+                } else {
+                  setDefaultModel("");
+                }
+              }} style={inputStyle}>
+                <option value="">-- Auto (first configured) --</option>
                 {activeProviders.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
+              <p style={{ fontSize: 12, color: "var(--color-text-muted)", marginTop: 6 }}>
+                {activeProviders.length === 0
+                  ? "No providers configured. Please add a provider first."
+                  : activeProviders.length === 1
+                    ? "Only one provider configured. It will be used as default."
+                    : "Select which provider to use as default. If not selected, the first configured provider will be used."}
+              </p>
             </div>
             <div>
               <label style={{ fontSize: 14, color: "var(--color-text-muted)", display: "block", marginBottom: 10 }}>Default Model</label>
-              <select value={defaultModel} onChange={(e) => setDefaultModel(e.target.value)} style={inputStyle}>
-                {activeProviders.flatMap((p) => p.models.map((m) => <option key={`${p.id}-${m.id}`} value={m.id}>{p.name} / {m.name}</option>))}
+              <select
+                value={defaultModel}
+                onChange={(e) => setDefaultModel(e.target.value)}
+                style={inputStyle}
+                disabled={!defaultProvider}
+              >
+                <option value="">-- Auto (first model) --</option>
+                {defaultProvider && activeProviders
+                  .find(p => p.id === defaultProvider)
+                  ?.models.map((m) => (
+                    <option key={m.id} value={m.id}>{m.name}</option>
+                  )) || []}
               </select>
+              {!defaultProvider && activeProviders.length > 0 && (
+                <p style={{ fontSize: 12, color: "var(--color-text-muted)", marginTop: 6 }}>
+                  No provider selected. The first model of the first configured provider will be used.
+                </p>
+              )}
             </div>
             <div>
               <label style={{ fontSize: 14, color: "var(--color-text-muted)", display: "block", marginBottom: 10 }}>Max Iterations (agent loop)</label>
@@ -424,6 +476,15 @@ export default function SettingsPage() {
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                       <h3 style={{ fontSize: 16, fontWeight: 600 }}>{p.name}</h3>
+                      {(defaultProvider === p.id || (!defaultProvider && activeProviders[0]?.id === p.id)) && (
+                        <span style={{
+                          display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, fontWeight: 600,
+                          color: "var(--color-info)", background: "rgba(59,130,246,0.1)",
+                          padding: "2px 8px", borderRadius: 4, border: "1px solid rgba(59,130,246,0.3)"
+                        }}>
+                          DEFAULT
+                        </span>
+                      )}
                       {p.is_configured
                         ? <span style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--color-success)" }}><Check size={13} /> Active</span>
                         : <span style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--color-text-muted)" }}><AlertTriangle size={13} /> No key</span>}
@@ -436,25 +497,36 @@ export default function SettingsPage() {
                   <input type="text" value={baseUrls[p.id] || ""} onChange={(e) => setBaseUrls((prev) => ({ ...prev, [p.id]: e.target.value }))} placeholder="Base URL (optional, leave empty for default)" style={{ ...inputStyle, marginBottom: 16, fontSize: 13, color: "var(--color-text-muted)" }} />
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
                     <span style={{ fontSize: 13, color: "var(--color-text-muted)" }}>Models</span>
-                    <button onClick={() => { setShowAddModel(p.id); setNewModelId(""); setNewModelName(""); }} style={btnSmall}>
-                      <Plus size={11} /> Add Model
+                    <button onClick={() => { setShowAddModel(p.id); setNewModelName(""); }} style={btnSmall}>
+                      <Plus size={11} /> Add
                     </button>
                   </div>
                   {showAddModel === p.id && (
                     <div style={{ display: "flex", gap: 8, marginBottom: 10, padding: "10px 12px", background: "var(--color-bg-secondary)", borderRadius: 8, border: "1px solid var(--color-border-default)" }}>
-                      <input type="text" value={newModelId} onChange={(e) => setNewModelId(e.target.value)} placeholder="Model ID (e.g. gpt-4o)" style={{ ...inputStyle, fontSize: 13, padding: "8px 12px", marginBottom: 0, flex: 1 }} />
-                      <input type="text" value={newModelName} onChange={(e) => setNewModelName(e.target.value)} placeholder="Display name" style={{ ...inputStyle, fontSize: 13, padding: "8px 12px", marginBottom: 0, flex: 1 }} />
+                      <input type="text" value={newModelName} onChange={(e) => setNewModelName(e.target.value)} placeholder="Model name (e.g. gpt-4o)" style={{ ...inputStyle, fontSize: 13, padding: "8px 12px", marginBottom: 0, flex: 1 }} onKeyDown={(e) => e.key === "Enter" && handleAddCustomModel(p.id)} />
                       <button onClick={() => handleAddCustomModel(p.id)} style={{ ...btnSmall, background: "var(--color-success)", color: "white", border: "none" }}>Add</button>
                       <button onClick={() => setShowAddModel(null)} style={btnSmall}><X size={11} /></button>
                     </div>
                   )}
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                    {p.models.map((m) => (
-                      <span key={m.id} style={{ padding: "4px 12px", background: "var(--color-bg-elevated)", borderRadius: 6, fontSize: 13, color: "var(--color-text-muted)", display: "flex", alignItems: "center", gap: 6 }}>
-                        {m.name}
-                        <button onClick={() => handleRemoveCustomModel(p.id, m.id)} style={{ background: "none", border: "none", color: "var(--color-text-muted)", cursor: "pointer", padding: 0, display: "flex" }}><X size={10} /></button>
-                      </span>
-                    ))}
+                    {p.models.map((m) => {
+                      const isDefaultModel = (defaultProvider === p.id || (!defaultProvider && activeProviders[0]?.id === p.id)) &&
+                        (defaultModel === m.id || (!defaultModel && p.models[0]?.id === m.id));
+                      return (
+                        <span key={m.id} style={{
+                          padding: "4px 12px",
+                          background: isDefaultModel ? "rgba(59,130,246,0.1)" : "var(--color-bg-elevated)",
+                          borderRadius: 6, fontSize: 13,
+                          color: isDefaultModel ? "var(--color-info)" : "var(--color-text-muted)",
+                          display: "flex", alignItems: "center", gap: 6,
+                          border: isDefaultModel ? "1px solid rgba(59,130,246,0.3)" : "1px solid transparent",
+                        }}>
+                          {m.name}
+                          {isDefaultModel && <span style={{ fontSize: 10, fontWeight: 600 }}>★</span>}
+                          <button onClick={() => handleRemoveCustomModel(p.id, m.id)} style={{ background: "none", border: "none", color: "var(--color-text-muted)", cursor: "pointer", padding: 0, display: "flex" }}><X size={10} /></button>
+                        </span>
+                      );
+                    })}
                   </div>
                 </div>
               ))}

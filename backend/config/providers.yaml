@@ -24,11 +24,11 @@ providers:
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
     models:
-    - id: deepseek-chat
-      name: DeepSeek Chat
+    - id: deepseek-v4-pro
+      name: deepseek-v4-pro
       max_tokens: 4096
-    - id: deepseek-reasoner
-      name: DeepSeek Reasoner
+    - id: deepseek-v4-flash
+      name: deepseek-v4-flash
       max_tokens: 4096
   moonshot:
     name: Moonshot (月之暗面)
@@ -60,14 +60,11 @@ providers:
       max_tokens: 4096
   mimo:
     name: Xiaomi MiMo (小米)
-    base_url: https://token-plan-sgp.xiaomimimo.com/v1
+    base_url: https://api.xiaomimimo.com/v1
     api_key_env: MIMO_API_KEY
     models:
     - id: mimo-v2.5-pro
       name: MiMo V2.5 Pro
-      max_tokens: 4096
-    - id: mimo-v2.5-flash
-      name: MiMo V2.5 Flash
       max_tokens: 4096
     - id: mimo-v2-pro
       name: MiMo V2 Pro
@@ -104,5 +101,5 @@ providers:
       name: Code Llama
       max_tokens: 4096
 defaults:
-  provider: openai
-  model: gpt-4o
+  provider: deepseek
+  model: deepseek-v4-pro

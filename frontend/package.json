@@ -15,7 +15,10 @@
     "@xyflow/react": "^12.3.0",
     "framer-motion": "^11.15.0",
     "lucide-react": "^0.468.0",
-    "clsx": "^2.1.1"
+    "clsx": "^2.1.1",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

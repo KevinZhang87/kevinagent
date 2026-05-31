@@ -1,20 +1,39 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import String, Text, DateTime, Integer, Float, JSON, Boolean, func, Index
+from sqlalchemy import String, Text, DateTime, Integer, Float, JSON, Boolean, func, Index, text as sa_text
 from datetime import datetime
 from typing import Optional
+import logging
 
 from app.config import app_config
 
-# Create engine with database-specific settings
-engine_kwargs = {"echo": app_config.database.echo}
+logger = logging.getLogger("kevin_agent.db")
 
-# SQLite doesn't support pool_size/max_overflow
-if app_config.database.type != "sqlite":
+# Create engine with database-specific settings
+engine_kwargs: dict = {"echo": app_config.database.echo}
+
+if app_config.database.type == "sqlite":
+    # SQLite: enable WAL mode for concurrent reads + writes
+    engine_kwargs["connect_args"] = {
+        "check_same_thread": False,
+        "timeout": 30,  # seconds to wait for lock before giving up
+    }
+else:
     engine_kwargs["pool_size"] = app_config.database.pool_size
     engine_kwargs["max_overflow"] = app_config.database.max_overflow
 
 engine = create_async_engine(app_config.database.url, **engine_kwargs)
+
+# Enable SQLite WAL mode on every new connection for concurrent read/write support
+if app_config.database.type == "sqlite":
+    from sqlalchemy import event
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -73,6 +92,7 @@ class Skill(Base):
     fail_count: Mapped[int] = mapped_column(Integer, default=0)
     version: Mapped[int] = mapped_column(Integer, default=1)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    failure_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array of recent failure contexts
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -154,9 +174,26 @@ class TaskExecution(Base):
     )
 
 
+async def _migrate_sqlite(conn):
+    """Add missing columns to existing SQLite tables (CREATE_ALL doesn't auto-migrate)."""
+    if app_config.database.type != "sqlite":
+        return
+
+    # skills.failure_notes — added for evolve feature context storage
+    try:
+        result = await conn.execute(sa_text("PRAGMA table_info(skills)"))
+        columns = {row[1] for row in await result.fetchall()}
+        if "failure_notes" not in columns:
+            await conn.execute(sa_text("ALTER TABLE skills ADD COLUMN failure_notes TEXT"))
+            logger.info("Migration: added skills.failure_notes column")
+    except Exception as e:
+        logger.warning("Migration check for skills.failure_notes failed: %s", e)
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _migrate_sqlite(conn)
 
 
 async def get_session() -> AsyncSession:

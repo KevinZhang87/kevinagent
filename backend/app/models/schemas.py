@@ -7,8 +7,8 @@ from datetime import datetime
 class ChatRequest(BaseModel):
     message: str
     session_id: str
-    model: str = "gpt-4o"
-    provider: str = "openai"
+    model: str = ""
+    provider: str = ""
     agent_id: Optional[str] = None
 
 
@@ -29,8 +29,8 @@ class StreamChunk(BaseModel):
 # Agent schemas
 class AgentCreate(BaseModel):
     name: str
-    model: str = "gpt-4o"
-    provider: str = "openai"
+    model: str = ""
+    provider: str = ""
     parent_agent_id: Optional[str] = None
     task: Optional[str] = None
 

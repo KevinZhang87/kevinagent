@@ -13,13 +13,17 @@ import yaml
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-# Load .env file
-load_dotenv()
+# Backend root directory (parent of app/)
+BACKEND_DIR = Path(__file__).parent.parent
+
+# Load .env file from backend/.env (same path as Settings API writes to)
+ENV_PATH = BACKEND_DIR / ".env"
+load_dotenv(ENV_PATH)
 
 # Config directory path
-CONFIG_DIR = Path(__file__).parent.parent / "config"
+CONFIG_DIR = BACKEND_DIR / "config"
 
 
 def load_yaml(filename: str) -> dict:
@@ -215,13 +219,50 @@ def load_providers_config() -> dict[str, ProviderConfig]:
 
 
 def get_default_provider() -> tuple[str, str]:
-    """Get default provider and model IDs."""
+    """Get default provider and model IDs.
+
+    Priority:
+    1. Environment variables DEFAULT_PROVIDER / DEFAULT_MODEL
+    2. providers.yaml defaults (user-selected)
+    3. Auto-detect from active configured providers:
+       - If only 1 provider configured -> use that provider + its first model
+       - If multiple providers configured -> use the first configured provider + its first model
+       - If no providers configured -> return empty strings
+    """
+    # Check environment variables first
+    env_provider = get_env("DEFAULT_PROVIDER")
+    env_model = get_env("DEFAULT_MODEL")
+    if env_provider and env_model:
+        return env_provider, env_model
+
+    # Check providers.yaml defaults (user-selected)
     data = load_yaml("providers.yaml")
     defaults = data.get("defaults", {})
-    return (
-        get_env("DEFAULT_PROVIDER", defaults.get("provider", "openai")),
-        get_env("DEFAULT_MODEL", defaults.get("model", "gpt-4o")),
-    )
+    yaml_provider = defaults.get("provider", "")
+    yaml_model = defaults.get("model", "")
+
+    # If user has explicitly set defaults in yaml, use them
+    if yaml_provider and yaml_model:
+        return yaml_provider, yaml_model
+
+    # Auto-detect from configured providers
+    providers_data = load_providers_config()
+
+    # Filter to only configured providers (have API key or don't need one)
+    configured_providers = [
+        (pid, pconfig) for pid, pconfig in providers_data.items()
+        if pconfig.is_configured
+    ]
+
+    if not configured_providers:
+        # No providers configured - return empty strings
+        return "", ""
+
+    # Use the first configured provider
+    first_pid, first_config = configured_providers[0]
+    first_model = first_config.models[0].id if first_config.models else ""
+
+    return first_pid, first_model
 
 
 # ============================================
@@ -313,16 +354,16 @@ def load_sandbox_config():
 # ============================================
 
 app_config = load_app_config()
-providers_config = load_providers_config()
 tools_config = load_tools_config()
 sandbox_config = load_sandbox_config()
+providers_config = load_providers_config()
 default_provider, default_model = get_default_provider()
 
 
 def reload_config():
     """Reload all config from files. Call after saving settings."""
     global app_config, providers_config, tools_config, sandbox_config, default_provider, default_model
-    load_dotenv(override=True)
+    load_dotenv(ENV_PATH, override=True)
     app_config = load_app_config()
     providers_config = load_providers_config()
     tools_config = load_tools_config()

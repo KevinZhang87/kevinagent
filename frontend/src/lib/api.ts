@@ -11,8 +11,8 @@ export interface StreamChunk {
 export async function* streamChat(
   message: string,
   sessionId: string,
-  provider: string = "openai",
-  model: string = "gpt-4o",
+  provider: string = "",
+  model: string = "",
   agentId: string = "main"
 ): AsyncGenerator<StreamChunk> {
   const response = await fetch(`${API_BASE}/api/chat`, {
@@ -57,8 +57,8 @@ export async function* streamChat(
 export async function* streamChatWithFiles(
   message: string,
   sessionId: string,
-  provider: string = "openai",
-  model: string = "gpt-4o",
+  provider: string = "",
+  model: string = "",
   files: File[] = [],
   agentId: string = "main"
 ): AsyncGenerator<StreamChunk> {
@@ -163,6 +163,10 @@ export async function addCustomModel(providerId: string, modelId: string, modelN
   const res = await fetch(`${API_BASE}/api/models/providers/${providerId}/models?model_id=${encodeURIComponent(modelId)}&model_name=${encodeURIComponent(modelName)}&max_tokens=${maxTokens}`, {
     method: "POST",
   });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Unknown error" }));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
   return res.json();
 }
 
@@ -170,6 +174,10 @@ export async function removeCustomModel(providerId: string, modelId: string) {
   const res = await fetch(`${API_BASE}/api/models/providers/${providerId}/models/${encodeURIComponent(modelId)}`, {
     method: "DELETE",
   });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Unknown error" }));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
   return res.json();
 }
 

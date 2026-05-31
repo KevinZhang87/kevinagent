@@ -242,3 +242,29 @@ async def trigger_task(task_id: str):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/reset-agents")
+async def reset_stuck_agents():
+    """Reset all agents stuck in 'thinking' status to 'idle'."""
+    from app.core.agent import agent_manager
+    reset_count = 0
+    for agent_id, agent in agent_manager._agents.items():
+        if agent.status == "thinking":
+            agent.status = "idle"
+            agent.current_task = ""
+            reset_count += 1
+            # Also sync to DB
+            try:
+                from app.models.database import AgentState
+                from sqlalchemy import update as sql_update
+                async with async_session() as session:
+                    await session.execute(
+                        sql_update(AgentState).where(AgentState.agent_id == agent_id).values(
+                            status="idle", current_task=""
+                        )
+                    )
+                    await session.commit()
+            except Exception:
+                pass
+    return {"status": "ok", "reset_count": reset_count}

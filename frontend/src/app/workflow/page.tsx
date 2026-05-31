@@ -20,7 +20,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { fetchWorkflow, createAgent, deleteAgent, updateAgent } from "@/lib/api";
-import { AppProvider, useApp } from "@/contexts/AppContext";
+import { useApp } from "@/contexts/AppContext";
 import { Bot, Cpu, Zap, RefreshCw, Plus, Trash2, Activity, X, Settings } from "lucide-react";
 
 const statusColors: Record<string, string> = {
@@ -155,6 +155,26 @@ function WorkflowPageContent() {
   const [editAgent, setEditAgent] = useState({ agent_id: "", provider: "", model: "", parent_agent_id: "" });
   const [selectedAgent, setSelectedAgent] = useState<AgentInfo | null>(null);
   const [editError, setEditError] = useState("");
+  // Track agent activity log (status changes with timestamps)
+  const [agentActivity, setAgentActivity] = useState<Record<string, Array<{ time: Date; status: string; task: string }>>>({});
+
+  // Update activity log when wsAgents changes
+  useEffect(() => {
+    setAgentActivity((prev) => {
+      const updated = { ...prev };
+      for (const agent of wsAgents) {
+        const lastEntry = updated[agent.agent_id]?.[updated[agent.agent_id]?.length - 1];
+        // Only add entry if status or task changed
+        if (!lastEntry || lastEntry.status !== agent.status || lastEntry.task !== (agent.current_task || "")) {
+          const entries = updated[agent.agent_id] || [];
+          entries.push({ time: new Date(), status: agent.status, task: agent.current_task || "" });
+          // Keep last 20 entries per agent
+          updated[agent.agent_id] = entries.slice(-20);
+        }
+      }
+      return updated;
+    });
+  }, [wsAgents]);
 
   const loadWorkflow = useCallback(async () => {
     setLoading(true);
@@ -318,6 +338,11 @@ function WorkflowPageContent() {
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          onNodeClick={(_, node) => {
+            const agent = agentList.find((a) => a.agent_id === node.data.agent_id);
+            if (agent) setSelectedAgent(agent);
+          }}
+          onPaneClick={() => setSelectedAgent(null)}
           nodeTypes={nodeTypes}
           fitView
           style={{ background: "var(--color-bg-primary)" }}
@@ -359,11 +384,12 @@ function WorkflowPageContent() {
 
             {/* Agent Detail */}
             {selectedAgent && (
-              <div style={{ marginTop: 8, padding: 10, background: "var(--color-bg-secondary)", borderRadius: 8, border: "1px solid var(--color-border-default)" }}>
+              <div style={{ marginTop: 8, padding: 10, background: "var(--color-bg-secondary)", borderRadius: 8, border: `1px solid ${selectedAgent.status !== "idle" ? statusColors[selectedAgent.status] : "var(--color-border-default)"}`, transition: "border-color 0.3s" }}>
+                {/* Header */}
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <div style={{ width: 22, height: 22, borderRadius: 6, background: "var(--color-bg-elevated)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                      {selectedAgent.agent_id === "main" ? <Bot size={11} /> : <Cpu size={11} />}
+                    <div style={{ width: 22, height: 22, borderRadius: 6, background: selectedAgent.status !== "idle" ? `${statusColors[selectedAgent.status]}20` : "var(--color-bg-elevated)", display: "flex", alignItems: "center", justifyContent: "center", transition: "background 0.3s" }}>
+                      {selectedAgent.agent_id === "main" ? <Bot size={11} color={statusColors[selectedAgent.status]} /> : <Cpu size={11} color={statusColors[selectedAgent.status]} />}
                     </div>
                     <span style={{ fontSize: 12, fontWeight: 600 }}>{selectedAgent.agent_id === "main" ? "Main Agent" : selectedAgent.agent_id}</span>
                   </div>
@@ -371,11 +397,23 @@ function WorkflowPageContent() {
                     <Settings size={10} /> Edit
                   </button>
                 </div>
-                <div style={{ fontSize: 11, color: "var(--color-text-muted)", display: "flex", flexDirection: "column", gap: 4 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <span>Status</span>
-                    <span style={{ color: statusColors[selectedAgent.status] || "var(--color-text-muted)", fontWeight: 500 }}>{statusLabels[selectedAgent.status] || selectedAgent.status}</span>
+
+                {/* Status with animated indicator */}
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6, padding: "6px 8px", background: selectedAgent.status !== "idle" ? `${statusColors[selectedAgent.status]}10` : "var(--color-bg-elevated)", borderRadius: 6, transition: "background 0.3s" }}>
+                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: statusColors[selectedAgent.status] || "var(--color-text-muted)", boxShadow: selectedAgent.status !== "idle" ? `0 0 8px ${statusColors[selectedAgent.status]}` : "none", animation: selectedAgent.status === "thinking" ? "pulse 1.5s infinite" : "none" }} />
+                  <span style={{ fontSize: 11, fontWeight: 600, color: statusColors[selectedAgent.status] || "var(--color-text-muted)" }}>{statusLabels[selectedAgent.status] || selectedAgent.status}</span>
+                </div>
+
+                {/* Current Task - Full display when executing */}
+                {selectedAgent.current_task && (
+                  <div style={{ marginBottom: 6, padding: "6px 8px", background: "var(--color-bg-elevated)", borderRadius: 6, border: "1px solid var(--color-border-default)" }}>
+                    <div style={{ fontSize: 10, color: "var(--color-text-muted)", marginBottom: 3, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5 }}>Current Task</div>
+                    <p style={{ margin: 0, fontSize: 11, color: "var(--color-text-secondary)", lineHeight: 1.5, wordBreak: "break-word" }}>{selectedAgent.current_task}</p>
                   </div>
+                )}
+
+                {/* Basic Info */}
+                <div style={{ fontSize: 11, color: "var(--color-text-muted)", display: "flex", flexDirection: "column", gap: 3 }}>
                   {selectedAgent.parent_agent_id && (
                     <div style={{ display: "flex", justifyContent: "space-between" }}>
                       <span>Parent</span>
@@ -421,13 +459,28 @@ function WorkflowPageContent() {
                       </select>
                     </div>
                   </div>
-                  {selectedAgent.current_task && (
-                    <div>
-                      <span>Task</span>
-                      <p style={{ margin: "3px 0 0", fontSize: 11, color: "var(--color-text-secondary)", lineHeight: 1.4, overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>{selectedAgent.current_task}</p>
-                    </div>
-                  )}
                 </div>
+
+                {/* Activity Log */}
+                {agentActivity[selectedAgent.agent_id] && agentActivity[selectedAgent.agent_id].length > 0 && (
+                  <div style={{ marginTop: 6, padding: "6px 8px", background: "var(--color-bg-elevated)", borderRadius: 6, border: "1px solid var(--color-border-default)" }}>
+                    <div style={{ fontSize: 10, color: "var(--color-text-muted)", marginBottom: 4, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5 }}>Activity Log</div>
+                    <div style={{ maxHeight: 120, overflowY: "auto" }}>
+                      {agentActivity[selectedAgent.agent_id].slice(-8).reverse().map((entry, i) => (
+                        <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 6, padding: "3px 0", borderBottom: i < 7 ? "1px solid var(--color-border-default)" : "none" }}>
+                          <span style={{ width: 5, height: 5, borderRadius: "50%", background: statusColors[entry.status] || "var(--color-text-muted)", flexShrink: 0, marginTop: 4 }} />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                              <span style={{ fontSize: 10, color: statusColors[entry.status] || "var(--color-text-muted)", fontWeight: 500 }}>{statusLabels[entry.status] || entry.status}</span>
+                              <span style={{ fontSize: 9, color: "var(--color-text-muted)", opacity: 0.6 }}>{entry.time.toLocaleTimeString()}</span>
+                            </div>
+                            {entry.task && <div style={{ fontSize: 9, color: "var(--color-text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.task}</div>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </Panel>
@@ -552,9 +605,5 @@ function WorkflowPageContent() {
 }
 
 export default function WorkflowPage() {
-  return (
-    <AppProvider>
-      <WorkflowPageContent />
-    </AppProvider>
-  );
+  return <WorkflowPageContent />;
 }

@@ -106,6 +106,30 @@ async def _execute_task(task_record: ScheduledTask):
 
         logger.info("Task %s completed in %.1fs", task_record.task_id, elapsed)
 
+    except asyncio.CancelledError:
+        # Task was stopped/paused while running — reset agent status to idle
+        logger.info("Task %s cancelled during execution, resetting agent status", task_record.task_id)
+        try:
+            from app.core.agent import agent_manager
+            agent_id = task_record.agent_id or "main"
+            agent = agent_manager.get_agent(agent_id)
+            if agent:
+                agent.status = "idle"
+                agent.current_task = ""
+            # Also sync to DB so frontend shows correct status
+            from app.models.database import AgentState
+            from sqlalchemy import update as sql_update
+            async with async_session() as session:
+                await session.execute(
+                    sql_update(AgentState).where(AgentState.agent_id == agent_id).values(
+                        status="idle", current_task=""
+                    )
+                )
+                await session.commit()
+        except Exception as cleanup_err:
+            logger.warning("Failed to reset agent status after cancellation: %s", cleanup_err)
+        raise  # Re-raise so _task_loop can catch it and break
+
     except Exception as e:
         elapsed = (datetime.utcnow() - started).total_seconds()
         logger.error("Task %s failed: %s", task_record.task_id, e)
@@ -196,10 +220,26 @@ async def start_task(task_id: str):
 
 
 def stop_task(task_id: str):
-    """Stop a running task loop."""
+    """Stop a running task loop and reset associated agent status."""
     t = _running.pop(task_id, None)
     if t and not t.done():
         t.cancel()
+
+    # Reset agent status for task_executor agents
+    # Task executors use agent_id like "task_{task_id}" or the configured agent_id
+    try:
+        from app.core.agent import agent_manager
+        # Check all agents and reset any that are stuck in "thinking" from this task
+        for agent_id, agent in agent_manager._agents.items():
+            if agent.status == "thinking" and (
+                agent_id.startswith("task_") or
+                f"task_{task_id}" in agent.current_task
+            ):
+                agent.status = "idle"
+                agent.current_task = ""
+                logger.info("Reset agent '%s' status to idle (task %s stopped)", agent_id, task_id)
+    except Exception as e:
+        logger.warning("Failed to reset agent status on task stop: %s", e)
 
 
 async def start_all_active_tasks():

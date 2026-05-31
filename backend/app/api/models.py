@@ -21,8 +21,8 @@ PROVIDERS_YAML = CONFIG_DIR / "providers.yaml"
 class SettingsSaveRequest(BaseModel):
     api_keys: dict[str, str] = {}
     base_urls: dict[str, str] = {}
-    default_provider: str = "openai"
-    default_model: str = "gpt-4o"
+    default_provider: str = ""
+    default_model: str = ""
     max_iterations: int = 30
     active_providers: list[str] = []
     custom_models: dict[str, list[dict]] = {}  # provider_id -> [{id, name, max_tokens}]
@@ -60,10 +60,18 @@ def update_providers_yaml(dp: str, dm: str, base_urls: dict[str, str], custom_mo
     if PROVIDERS_YAML.exists():
         with open(PROVIDERS_YAML, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-    if "defaults" not in data:
-        data["defaults"] = {}
-    data["defaults"]["provider"] = dp
-    data["defaults"]["model"] = dm
+
+    # Update defaults - if both are empty, remove the defaults section
+    # so the system will auto-detect from configured providers
+    if dp and dm:
+        if "defaults" not in data:
+            data["defaults"] = {}
+        data["defaults"]["provider"] = dp
+        data["defaults"]["model"] = dm
+    else:
+        # Clear defaults to enable auto-detection
+        data.pop("defaults", None)
+
     for pid, url in base_urls.items():
         if url and pid in data.get("providers", {}):
             data["providers"][pid]["base_url"] = url
@@ -89,7 +97,7 @@ def update_providers_yaml(dp: str, dm: str, base_urls: dict[str, str], custom_mo
 
     with open(PROVIDERS_YAML, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-    logger.info("Updated providers.yaml: default=%s/%s", dp, dm)
+    logger.info("Updated providers.yaml: default=%s/%s", dp or "(auto)", dm or "(auto)")
 
 
 def update_app_yaml(max_iter: int, active: list[str] = None):
@@ -188,6 +196,7 @@ async def get_current_config():
             pid: {"base_url": p.base_url, "is_configured": p.is_configured}
             for pid, p in cfg.providers_config.items()
         },
+        "auto_detected": not (cfg.get_env("DEFAULT_PROVIDER") and cfg.get_env("DEFAULT_MODEL")),
     }
 
 
@@ -216,6 +225,8 @@ async def save_settings(request: SettingsSaveRequest):
             update_env_file(env_updates)
 
         # Update providers config
+        # If default_provider is empty, clear the defaults in providers.yaml
+        # so the system will auto-detect from configured providers
         update_providers_yaml(
             request.default_provider,
             request.default_model,

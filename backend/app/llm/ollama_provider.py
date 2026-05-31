@@ -1,5 +1,5 @@
 from typing import AsyncIterator
-from .base import BaseLLMProvider, LLMMessage, LLMResponse, LLMStreamChunk
+from .base import BaseLLMProvider, LLMMessage, LLMResponse, LLMStreamChunk, cleanup_tool_call_messages
 import httpx
 import json
 
@@ -12,7 +12,16 @@ class OllamaProvider(BaseLLMProvider):
         self.base_url = base_url.rstrip("/")
 
     def _format_messages(self, messages: list[LLMMessage]) -> list[dict]:
-        """Format messages for Ollama API."""
+        """Format messages for Ollama API.
+
+        Ollama requires:
+        - tool messages must follow an assistant message with tool_calls
+        - ALL tool_calls must have corresponding tool messages
+        """
+        # First: clean up incomplete tool-call sequences
+        messages = cleanup_tool_call_messages(messages)
+
+        # Then: convert to Ollama native API format
         formatted = []
         for m in messages:
             if m.role == "assistant" and m.tool_calls:

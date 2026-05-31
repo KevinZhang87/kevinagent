@@ -1,7 +1,7 @@
 import json
 import logging
 from datetime import datetime
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, or_
 
 from app.models.database import Memory, Message, Conversation, async_session
 
@@ -75,14 +75,16 @@ class MemoryManager:
 
     async def get_messages(self, limit: int = 50) -> list[dict]:
         async with async_session() as session:
+            # Use ID for ordering to ensure correct sequence
+            # (created_at can be the same for messages saved in parallel)
             result = await session.execute(
                 select(Message)
                 .where(Message.session_id == self.session_id)
-                .order_by(Message.created_at)
+                .order_by(desc(Message.id))
                 .limit(limit)
             )
             messages = []
-            for msg in result.scalars():
+            for msg in reversed(result.scalars().all()):
                 messages.append({
                     "role": msg.role,
                     "content": msg.content,
@@ -103,14 +105,17 @@ class MemoryManager:
             await session.commit()
             logger.info("Memory saved: type=%s importance=%.1f len=%d", memory_type, importance, len(content))
 
-    async def get_relevant_memories(self, query: str = "", limit: int = 10) -> list[dict]:
+    async def get_relevant_memories(self, query: str = "", limit: int = 5) -> list[dict]:
         async with async_session() as session:
-            result = await session.execute(
-                select(Memory)
-                .where(Memory.session_id == self.session_id)
-                .order_by(desc(Memory.importance))
-                .limit(limit)
-            )
+            stmt = select(Memory).where(Memory.session_id == self.session_id)
+            # Keyword matching: split query into words and filter by LIKE
+            if query and query.strip():
+                keywords = [kw.strip() for kw in query.split() if len(kw.strip()) >= 2][:5]
+                if keywords:
+                    conditions = [Memory.content.ilike(f"%{kw}%") for kw in keywords]
+                    stmt = stmt.where(or_(*conditions))
+            stmt = stmt.order_by(desc(Memory.importance)).limit(limit)
+            result = await session.execute(stmt)
             return [
                 {
                     "id": m.id,
@@ -225,8 +230,11 @@ class MemoryManager:
 
     async def get_conversations(self) -> list[dict]:
         async with async_session() as session:
+            # Exclude child sessions (child_{agent_id}_{prefix}_{uuid}) from the list
             result = await session.execute(
-                select(Conversation).order_by(desc(Conversation.updated_at))
+                select(Conversation)
+                .where(~Conversation.session_id.like("child_%"))
+                .order_by(desc(Conversation.updated_at))
             )
             return [
                 {
@@ -246,7 +254,7 @@ class MemoryManager:
             result = await session.execute(
                 select(Message)
                 .where(Message.session_id == session_id)
-                .order_by(Message.created_at)
+                .order_by(Message.id)
                 .limit(limit)
             )
             messages = []

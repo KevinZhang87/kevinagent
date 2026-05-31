@@ -9,12 +9,15 @@ build/
 venv/
 .venv/
 *.db
+*.db-shm
+*.db-wal
 .deps_installed
 
 # Node
 node_modules/
 .next/
 out/
+*.tsbuildinfo
 
 # IDE
 .idea/
@@ -41,6 +44,7 @@ Thumbs.db
 sandbox_workspace/
 workspaces/
 shared_workspace/
+backend/sandbox/
 
 # Sensitive config overrides (keep .yaml.example files)
 backend/config/app.local.yaml
@@ -49,3 +53,6 @@ backend/config/providers.local.yaml
 # Uploads and temp files
 backend/uploads/
 backend/temp/
+
+# Claude Code settings (may contain local paths)
+.claude/

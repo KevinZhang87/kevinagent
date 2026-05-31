@@ -52,13 +52,23 @@ class ToolRegistry:
     def get_all_names(self) -> list[str]:
         return list(self._tools.keys())
 
-    async def execute(self, name: str, arguments: dict, agent_id: str = None) -> ToolResult:
+    async def execute(self, name: str, arguments: dict, agent_id: str = None, on_progress=None, caller_session_id: str = "") -> ToolResult:
         tool = self.get(name)
         if not tool:
             return ToolResult(success=False, output="", error=f"Unknown tool: {name}")
         try:
-            # Pass agent_id to tools that need it (for sandbox isolation)
-            return await tool.execute(**arguments, agent_id=agent_id)
+            # Pass caller agent_id for sandbox isolation, but avoid collision
+            # with tool arguments that also use 'agent_id' (e.g. call_agent)
+            kwargs = dict(arguments)
+            if "agent_id" not in kwargs and agent_id:
+                kwargs["agent_id"] = agent_id
+            # Pass on_progress callback for tools that support streaming (e.g. call_agent)
+            if on_progress:
+                kwargs["on_progress"] = on_progress
+            # Pass caller_session_id so child agents write to the parent's session
+            if caller_session_id:
+                kwargs["caller_session_id"] = caller_session_id
+            return await tool.execute(**kwargs)
         except Exception as e:
             return ToolResult(success=False, output="", error=str(e))
 
@@ -215,12 +225,13 @@ class PythonExecTool(BaseTool):
 
 class MemorySaveTool(BaseTool):
     name = "memory_save"
-    description = "Save important information to long-term memory."
+    description = "Save important information to long-term memory. Use memory_type to categorize: 'general' for facts, 'user_preference' for user preferences/likes/needs, 'skill' for learned patterns."
     parameters = {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "The information to remember"},
             "importance": {"type": "number", "description": "Importance score 0-1", "default": 0.5},
+            "memory_type": {"type": "string", "description": "Memory category: 'general', 'user_preference', 'skill', 'context_summary'", "enum": ["general", "user_preference", "skill", "context_summary"], "default": "general"},
         },
         "required": ["content"],
     }
@@ -232,17 +243,17 @@ class MemorySaveTool(BaseTool):
 
 class CallAgentTool(BaseTool):
     name = "call_agent"
-    description = "Delegate a task to another agent."
+    description = "Delegate a task to a specific sub-agent. Use this when the user's request involves a sub-agent's specialty area. You can issue multiple call_agent calls in one response for parallel sub-tasks. Use list_agents to see available agents first."
     parameters = {
         "type": "object",
         "properties": {
-            "agent_id": {"type": "string", "description": "Agent ID to call"},
-            "message": {"type": "string", "description": "Task to delegate"},
+            "agent_id": {"type": "string", "description": "The exact agent ID to delegate to (e.g. 'main', 'research_agent'). Use list_agents to see available IDs."},
+            "message": {"type": "string", "description": "A clear, specific task description for the sub-agent. Include all context needed."},
         },
         "required": ["agent_id", "message"],
     }
 
-    async def execute(self, agent_id: str = "", message: str = "", **kwargs) -> ToolResult:
+    async def execute(self, agent_id: str = "", message: str = "", on_progress=None, caller_session_id: str = "", **kwargs) -> ToolResult:
         try:
             from app.core.agent import agent_manager
 
@@ -265,6 +276,7 @@ class CallAgentTool(BaseTool):
                         agent_id=state.agent_id,
                         provider=state.provider,
                         model=state.model,
+                        session_id=caller_session_id,  # Share parent's session
                     )
                 else:
                     available = list(agent_manager._agents.keys())
@@ -274,11 +286,49 @@ class CallAgentTool(BaseTool):
                         error=f"Agent '{agent_id}' not found. Available agents: {available}",
                     )
 
-            # Collect full response from the target agent
+            # If sub-agent has no custom system_prompt, prepend role context to message
+            effective_message = message
+            if not agent.system_prompt:
+                # Try to get role info from agent_config.json
+                try:
+                    import json
+                    from pathlib import Path
+                    config_path = Path(__file__).parent.parent.parent / "agent_config.json"
+                    if config_path.exists():
+                        with open(config_path, "r", encoding="utf-8") as f:
+                            cfg = json.load(f)
+                        agent_cfg = cfg.get("agents", {}).get(agent_id, {})
+                        if agent_cfg:
+                            desc = agent_cfg.get("description", "")
+                            caps = ", ".join(agent_cfg.get("capabilities", []))
+                            effective_message = f"[你的角色: {agent_id} - {desc}。能力: {caps}]\n\n{message}"
+                except Exception:
+                    pass
+
+            # Run child agent in its OWN session to avoid polluting parent's
+            # message history (mixing tool_calls from different agents breaks
+            # strict providers like DeepSeek).
+            import uuid
+            # Include parent session prefix so we can query child sessions later
+            parent_prefix = caller_session_id[:8] if caller_session_id else "unknown"
+            child_session = f"child_{agent_id}_{parent_prefix}_{uuid.uuid4().hex[:6]}"
+            logger.info("call_agent: delegating to '%s' (child_session=%s)", agent_id, child_session)
+
+            # Collect full response from the target agent, forwarding intermediate chunks
             full_response = ""
-            async for chunk in agent.chat(message):
+            async for chunk in agent.chat(effective_message, session_id=child_session):
                 if chunk.type == "text":
                     full_response += chunk.content
+                # Forward intermediate progress to parent agent's stream
+                if on_progress and chunk.type in ("text", "tool_call", "tool_result", "status"):
+                    try:
+                        await on_progress({
+                            "type": chunk.type,
+                            "content": chunk.content,
+                            "agent_id": agent_id,
+                        })
+                    except Exception:
+                        pass
 
             if not full_response:
                 return ToolResult(success=True, output=f"Agent '{agent_id}' returned no text response.")
@@ -294,13 +344,13 @@ class CallAgentTool(BaseTool):
 
 class CreateAgentTool(BaseTool):
     name = "create_agent"
-    description = "Create a new agent."
+    description = "Create a new sub-agent with a specific model and provider. Use this when you need a specialized agent that doesn't exist yet. After creation, use call_agent to delegate tasks to it."
     parameters = {
         "type": "object",
         "properties": {
-            "agent_id": {"type": "string", "description": "Agent ID (e.g. 'research_agent')"},
-            "model": {"type": "string", "description": "Model name"},
-            "provider": {"type": "string", "description": "Provider name"},
+            "agent_id": {"type": "string", "description": "Unique agent ID using ASCII characters (e.g. 'research_agent', 'data_agent'). Avoid Chinese characters."},
+            "model": {"type": "string", "description": "Model name (e.g. 'gpt-4o', 'mimo-v2.5-pro'). Defaults to system default."},
+            "provider": {"type": "string", "description": "Provider name (e.g. 'openai', 'mimo'). Defaults to system default."},
         },
         "required": ["agent_id"],
     }
@@ -320,11 +370,34 @@ class CreateAgentTool(BaseTool):
                     output=f"Agent '{agent_id}' already exists.",
                 )
 
+            # Limit dynamic agent creation to prevent runaway spawning
+            # Count non-pre-created agents (agents not in agent_config.json)
+            try:
+                import json
+                from pathlib import Path
+                config_path = Path(__file__).parent.parent.parent / "agent_config.json"
+                pre_created_ids = set()
+                if config_path.exists():
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    pre_created_ids = set(cfg.get("agents", {}).keys())
+                dynamic_count = sum(1 for aid in agent_manager._agents.keys() if aid not in pre_created_ids and aid != "main")
+                if dynamic_count >= 3:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=f"Dynamic agent limit reached (3). Existing dynamic agents: {[aid for aid in agent_manager._agents.keys() if aid not in pre_created_ids and aid != 'main']}",
+                    )
+            except Exception:
+                pass
+
             # Use defaults if not specified
             if not provider:
-                provider = "mimo"
+                from app.config import default_provider
+                provider = default_provider
             if not model:
-                model = "mimo-v2.5-pro"
+                from app.config import default_model
+                model = default_model
 
             # Create the agent
             await agent_manager.create_agent(
@@ -344,7 +417,7 @@ class CreateAgentTool(BaseTool):
 
 class ListAgentsTool(BaseTool):
     name = "list_agents"
-    description = "List all available agents."
+    description = "List all available agents with their status and capabilities. Use this before call_agent to see which agents you can delegate to."
     parameters = {
         "type": "object",
         "properties": {},

@@ -1,6 +1,6 @@
 import json
 from typing import AsyncIterator
-from .base import BaseLLMProvider, LLMMessage, LLMResponse, LLMStreamChunk
+from .base import BaseLLMProvider, LLMMessage, LLMResponse, LLMStreamChunk, cleanup_tool_call_messages
 
 
 class AnthropicProvider(BaseLLMProvider):
@@ -14,21 +14,43 @@ class AnthropicProvider(BaseLLMProvider):
         return anthropic.AsyncAnthropic(api_key=self.api_key)
 
     def _format_messages(self, messages: list[LLMMessage]) -> tuple[str, list[dict]]:
-        """Format messages for Anthropic API. Returns (system_msg, chat_messages)."""
+        """Format messages for Anthropic API. Returns (system_msg, chat_messages).
+
+        Anthropic requires:
+        - Messages must alternate between user and assistant roles
+        - An assistant with tool_use blocks must be followed by user message(s)
+          with tool_result blocks for ALL tool_use IDs
+        - The first message must be a user message
+        """
+        # First: clean up incomplete tool-call sequences (shared across all providers)
+        messages = cleanup_tool_call_messages(messages)
+
+        # Extract system message + convert to Anthropic format
         system_msg = ""
         chat_messages = []
         for m in messages:
             if m.role == "system":
                 system_msg = m.content
             elif m.role == "tool":
-                # Anthropic uses tool_result content blocks
+                # Anthropic requires tool_results in a USER role message.
+                # Merge consecutive tool messages into a single user message
+                # to follow Anthropic's canonical format.
+                tool_result_block = {
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id,
+                    "content": m.content,
+                }
+                # Check if the previous message is also a user with tool_results
+                if chat_messages and chat_messages[-1]["role"] == "user":
+                    prev_content = chat_messages[-1]["content"]
+                    if isinstance(prev_content, list) and prev_content and prev_content[0].get("type") == "tool_result":
+                        # Merge into the previous user message's tool_result blocks
+                        prev_content.append(tool_result_block)
+                        continue
+                # Otherwise, start a new user message
                 chat_messages.append({
                     "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": m.tool_call_id,
-                        "content": m.content,
-                    }],
+                    "content": [tool_result_block],
                 })
             elif m.role == "assistant" and m.tool_calls:
                 content_blocks = []
