@@ -26,10 +26,13 @@ class SettingsSaveRequest(BaseModel):
     max_iterations: int = 30
     active_providers: list[str] = []
     custom_models: dict[str, list[dict]] = {}  # provider_id -> [{id, name, max_tokens}]
+    memory_backend: str = ""  # sqlite | mem0
+    memory_config: dict = {}  # {vector_store: {provider, host, port}, llm: {provider, model}, embedder: {provider, model}}
 
 
-def update_env_file(updates: dict[str, str]):
-    """Update .env file with new key-value pairs."""
+def update_env_file(updates: dict[str, str], removals: set[str] = None):
+    """Update .env file with new key-value pairs and optionally remove keys."""
+    removals = removals or set()
     lines = []
     existing_keys = set()
     if ENV_FILE.exists():
@@ -39,6 +42,8 @@ def update_env_file(updates: dict[str, str]):
                 if stripped and not stripped.startswith("#"):
                     key = stripped.split("=", 1)[0].strip()
                     existing_keys.add(key)
+                    if key in removals:
+                        continue
                     if key in updates:
                         lines.append(f"{key}={updates[key]}\n")
                         del updates[key]
@@ -47,11 +52,11 @@ def update_env_file(updates: dict[str, str]):
                 else:
                     lines.append(line)
     for key, value in updates.items():
-        if key not in existing_keys:
+        if key not in existing_keys and key not in removals:
             lines.append(f"{key}={value}\n")
     with open(ENV_FILE, "w", encoding="utf-8") as f:
         f.writelines(lines)
-    logger.info("Updated .env file with %d keys", len(existing_keys))
+    logger.info("Updated .env file: added/updated=%d removed=%d", len(updates), len(removals))
 
 
 def update_providers_yaml(dp: str, dm: str, base_urls: dict[str, str], custom_models: dict[str, list[dict]] = None):
@@ -100,8 +105,8 @@ def update_providers_yaml(dp: str, dm: str, base_urls: dict[str, str], custom_mo
     logger.info("Updated providers.yaml: default=%s/%s", dp or "(auto)", dm or "(auto)")
 
 
-def update_app_yaml(max_iter: int, active: list[str] = None):
-    """Update app.yaml with max iterations and active providers."""
+def update_app_yaml(max_iter: int, active: list[str] = None, memory_backend: str = None, memory_config: dict = None):
+    """Update app.yaml with max iterations, active providers, and memory config."""
     data = {}
     if APP_YAML.exists():
         with open(APP_YAML, "r", encoding="utf-8") as f:
@@ -111,9 +116,18 @@ def update_app_yaml(max_iter: int, active: list[str] = None):
     data["agent"]["max_iterations"] = max_iter
     if active is not None:
         data["active_providers"] = active
+    # Memory backend config
+    if memory_backend:
+        if "memory" not in data:
+            data["memory"] = {}
+        data["memory"]["backend"] = memory_backend
+        if memory_config:
+            for key, val in memory_config.items():
+                if val:  # only write non-empty sections
+                    data["memory"][key] = val
     with open(APP_YAML, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-    logger.info("Updated app.yaml: max_iter=%d active=%s", max_iter, active)
+    logger.info("Updated app.yaml: max_iter=%d active=%s memory_backend=%s", max_iter, active, memory_backend)
 
 
 @router.get("/providers")
@@ -197,6 +211,8 @@ async def get_current_config():
             for pid, p in cfg.providers_config.items()
         },
         "auto_detected": not (cfg.get_env("DEFAULT_PROVIDER") and cfg.get_env("DEFAULT_MODEL")),
+        "memory_backend": cfg.app_config.memory_backend,
+        "memory_config": cfg.app_config.memory_config,
     }
 
 
@@ -207,8 +223,9 @@ async def save_settings(request: SettingsSaveRequest):
         logger.info("Saving settings: default=%s/%s active=%s",
                      request.default_provider, request.default_model, request.active_providers)
 
-        # Update .env file with API keys
+        # Update .env file with API keys and default provider/model
         env_updates = {}
+        env_removals = set()
         key_map = {
             "openai": "OPENAI_API_KEY",
             "anthropic": "ANTHROPIC_API_KEY",
@@ -221,8 +238,17 @@ async def save_settings(request: SettingsSaveRequest):
             env_key = key_map.get(pid)
             if env_key and key:
                 env_updates[env_key] = key
-        if env_updates:
-            update_env_file(env_updates)
+        # Sync default provider/model to .env so sub-agents pick up the latest user selection
+        if request.default_provider:
+            env_updates["DEFAULT_PROVIDER"] = request.default_provider
+        else:
+            env_removals.add("DEFAULT_PROVIDER")
+        if request.default_model:
+            env_updates["DEFAULT_MODEL"] = request.default_model
+        else:
+            env_removals.add("DEFAULT_MODEL")
+        if env_updates or env_removals:
+            update_env_file(env_updates, env_removals)
 
         # Update providers config
         # If default_provider is empty, clear the defaults in providers.yaml
@@ -235,7 +261,12 @@ async def save_settings(request: SettingsSaveRequest):
         )
 
         # Update app config
-        update_app_yaml(request.max_iterations, request.active_providers or None)
+        update_app_yaml(
+            request.max_iterations,
+            request.active_providers or None,
+            memory_backend=request.memory_backend or None,
+            memory_config=request.memory_config or None,
+        )
 
         # Reload configuration
         reload_config()

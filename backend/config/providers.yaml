@@ -102,4 +102,4 @@ providers:
       max_tokens: 4096
 defaults:
   provider: deepseek
-  model: deepseek-v4-pro
+  model: deepseek-v4-flash

@@ -12,6 +12,10 @@ python-dotenv>=1.0.0
 python-multipart>=0.0.18
 pyyaml>=6.0.0
 
+# Auth (multi-tenant)
+PyJWT>=2.10.0
+bcrypt>=4.2.0
+
 # Sandbox (optional - for Docker-based sandbox)
 aiodocker>=0.24.0
 
@@ -20,3 +24,8 @@ aiodocker>=0.24.0
 aiomysql>=0.2.0
 # PostgreSQL
 asyncpg>=0.30.0
+
+# Memory backend: mem0 (optional - for semantic vector search)
+# Install when memory.backend=mem0 in config/app.yaml
+# mem0ai>=0.1.0
+# qdrant-client>=1.7.0

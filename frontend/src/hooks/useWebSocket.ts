@@ -9,7 +9,24 @@ interface AgentState {
   current_task?: string;
   model?: string;
   provider?: string;
+  parent_agent_id?: string;
+  ephemeral?: boolean;
 }
+
+export interface AgentCreatedEvent {
+  agent_id: string;
+  status: string;
+  model: string;
+  provider: string;
+  parent_agent_id: string | null;
+  ephemeral: boolean;
+}
+
+export interface AgentDeletedEvent {
+  agent_id: string;
+}
+
+type WSEventCallback = (event: string, data: AgentCreatedEvent | AgentDeletedEvent) => void;
 
 const MAX_RETRIES = 10;
 const BASE_DELAY = 1000;
@@ -21,6 +38,14 @@ export function useWebSocket() {
   const retryCountRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
+  const eventCallbacksRef = useRef<WSEventCallback[]>([]);
+
+  const onAgentEvent = useCallback((callback: WSEventCallback) => {
+    eventCallbacksRef.current.push(callback);
+    return () => {
+      eventCallbacksRef.current = eventCallbacksRef.current.filter((cb) => cb !== callback);
+    };
+  }, []);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -31,7 +56,7 @@ export function useWebSocket() {
     ws.onopen = () => {
       if (!mountedRef.current) return;
       setConnected(true);
-      retryCountRef.current = 0; // Reset retry count on successful connect
+      retryCountRef.current = 0;
     };
 
     ws.onmessage = (event) => {
@@ -57,6 +82,24 @@ export function useWebSocket() {
             }
             return [...prev, update];
           });
+        } else if (data.type === "agent_created") {
+          const agentData = data.agent as AgentCreatedEvent;
+          setAgents((prev) => {
+            if (prev.some((a) => a.agent_id === agentData.agent_id)) return prev;
+            return [...prev, {
+              agent_id: agentData.agent_id,
+              status: agentData.status,
+              model: agentData.model,
+              provider: agentData.provider,
+              parent_agent_id: agentData.parent_agent_id || undefined,
+              ephemeral: agentData.ephemeral,
+            }];
+          });
+          eventCallbacksRef.current.forEach((cb) => cb("agent_created", agentData));
+        } else if (data.type === "agent_deleted") {
+          const deletedData = data as AgentDeletedEvent;
+          setAgents((prev) => prev.filter((a) => a.agent_id !== deletedData.agent_id));
+          eventCallbacksRef.current.forEach((cb) => cb("agent_deleted", deletedData));
         }
       } catch {}
     };
@@ -64,7 +107,6 @@ export function useWebSocket() {
     ws.onclose = () => {
       if (!mountedRef.current) return;
       setConnected(false);
-      // Exponential backoff with max retries
       if (retryCountRef.current < MAX_RETRIES) {
         const delay = Math.min(BASE_DELAY * Math.pow(2, retryCountRef.current), 30000);
         retryCountRef.current += 1;
@@ -85,5 +127,5 @@ export function useWebSocket() {
     };
   }, [connect]);
 
-  return { agents, connected };
+  return { agents, connected, onAgentEvent };
 }

@@ -1,18 +1,24 @@
 import json
 import logging
 from datetime import datetime
-from sqlalchemy import select, desc, or_
+from sqlalchemy import select, desc
 
-from app.models.database import Memory, Message, Conversation, async_session
+from app.models.database import Message, Conversation, async_session
+from app.memory import get_memory_backend, BaseMemoryBackend
 
 logger = logging.getLogger("kevin_agent.memory")
 
 
 class MemoryManager:
-    """Manages agent memory - short-term (conversation) and long-term (persistent)."""
+    """Manages agent memory - short-term (conversation) and long-term (persistent).
 
-    def __init__(self, session_id: str):
+    Long-term memory is delegated to a pluggable backend (SQLite or mem0).
+    Short-term messages and conversation metadata remain in SQLite directly.
+    """
+
+    def __init__(self, session_id: str, tenant_id: str = None):
         self.session_id = session_id
+        self._memory_backend: BaseMemoryBackend = get_memory_backend(session_id, tenant_id=tenant_id)
 
     async def add_message(self, role: str, content: str, tool_calls: list = None, tool_call_id: str = "", agent_id: str = "main"):
         async with async_session() as session:
@@ -94,123 +100,32 @@ class MemoryManager:
             return messages
 
     async def save_memory(self, content: str, importance: float = 0.5, memory_type: str = "general"):
-        async with async_session() as session:
-            mem = Memory(
-                session_id=self.session_id,
-                content=content,
-                importance=importance,
-                memory_type=memory_type,
-            )
-            session.add(mem)
-            await session.commit()
-            logger.info("Memory saved: type=%s importance=%.1f len=%d", memory_type, importance, len(content))
+        await self._memory_backend.save_memory(content, importance, memory_type)
 
     async def get_relevant_memories(self, query: str = "", limit: int = 5) -> list[dict]:
-        async with async_session() as session:
-            stmt = select(Memory).where(Memory.session_id == self.session_id)
-            # Keyword matching: split query into words and filter by LIKE
-            if query and query.strip():
-                keywords = [kw.strip() for kw in query.split() if len(kw.strip()) >= 2][:5]
-                if keywords:
-                    conditions = [Memory.content.ilike(f"%{kw}%") for kw in keywords]
-                    stmt = stmt.where(or_(*conditions))
-            stmt = stmt.order_by(desc(Memory.importance)).limit(limit)
-            result = await session.execute(stmt)
-            return [
-                {
-                    "id": m.id,
-                    "content": m.content,
-                    "importance": m.importance,
-                    "type": m.memory_type,
-                    "created_at": m.created_at.isoformat(),
-                }
-                for m in result.scalars()
-            ]
+        return await self._memory_backend.get_relevant_memories(query, limit)
 
     async def get_all_memories(self, session_id: str = None, memory_type: str = None, limit: int = 100) -> list[dict]:
         """Get all memories, optionally filtered by session or type."""
-        async with async_session() as session:
-            q = select(Memory).order_by(desc(Memory.importance))
-            if session_id:
-                q = q.where(Memory.session_id == session_id)
-            if memory_type:
-                q = q.where(Memory.memory_type == memory_type)
-            q = q.limit(limit)
-            result = await session.execute(q)
-            return [
-                {
-                    "id": m.id,
-                    "session_id": m.session_id,
-                    "content": m.content,
-                    "importance": m.importance,
-                    "type": m.memory_type,
-                    "created_at": m.created_at.isoformat(),
-                }
-                for m in result.scalars()
-            ]
+        return await self._memory_backend.get_all_memories(session_id, memory_type, limit)
 
     async def get_memory_stats(self) -> dict:
         """Get memory statistics."""
-        async with async_session() as session:
-            from sqlalchemy import func as sql_func
-            # Total count
-            count_result = await session.execute(select(sql_func.count(Memory.id)))
-            total = count_result.scalar() or 0
-            # By type
-            type_result = await session.execute(
-                select(Memory.memory_type, sql_func.count(Memory.id), sql_func.avg(Memory.importance))
-                .group_by(Memory.memory_type)
-            )
-            by_type = {row[0]: {"count": row[1], "avg_importance": round(row[2] or 0, 2)} for row in type_result}
-            # Sessions with memories
-            session_result = await session.execute(
-                select(sql_func.count(sql_func.distinct(Memory.session_id)))
-            )
-            session_count = session_result.scalar() or 0
-            return {"total": total, "by_type": by_type, "sessions_with_memories": session_count}
+        return await self._memory_backend.get_memory_stats()
 
     async def delete_memory(self, memory_id: int) -> bool:
         """Delete a specific memory by ID."""
-        async with async_session() as session:
-            from sqlalchemy import delete
-            result = await session.execute(delete(Memory).where(Memory.id == memory_id))
-            await session.commit()
-            return result.rowcount > 0
+        return await self._memory_backend.delete_memory(memory_id)
 
     async def update_memory(self, memory_id: int, content: str = None, importance: float = None, memory_type: str = None) -> bool:
         """Update a specific memory."""
-        async with async_session() as session:
-            result = await session.execute(select(Memory).where(Memory.id == memory_id))
-            mem = result.scalar_one_or_none()
-            if not mem:
-                return False
-            if content is not None:
-                mem.content = content
-            if importance is not None:
-                mem.importance = importance
-            if memory_type is not None:
-                mem.memory_type = memory_type
-            await session.commit()
-            return True
+        return await self._memory_backend.update_memory(memory_id, content, importance, memory_type)
 
     async def cleanup_memories(self, max_age_days: int = 30, min_importance: float = 0.3, dry_run: bool = False) -> list[int]:
         """Remove old, low-importance memories. Returns list of deleted IDs."""
-        async with async_session() as session:
-            from sqlalchemy import delete as sql_delete
-            cutoff = datetime.utcnow() - __import__("datetime").timedelta(days=max_age_days)
-            q = select(Memory).where(
-                Memory.importance < min_importance,
-                Memory.created_at < cutoff,
-            )
-            result = await session.execute(q)
-            to_delete = [m.id for m in result.scalars()]
-            if to_delete and not dry_run:
-                await session.execute(sql_delete(Memory).where(Memory.id.in_(to_delete)))
-                await session.commit()
-                logger.info("Cleaned up %d old memories (max_age=%dd, min_importance=%.1f)", len(to_delete), max_age_days, min_importance)
-            return to_delete
+        return await self._memory_backend.cleanup_memories(max_age_days, min_importance, dry_run)
 
-    async def create_or_update_conversation(self, title: str = "New Chat", model: str = "gpt-4o", provider: str = "openai"):
+    async def create_or_update_conversation(self, title: str = "New Chat", model: str = "gpt-4o", provider: str = "openai", tenant_id: str = None):
         async with async_session() as session:
             result = await session.execute(
                 select(Conversation).where(Conversation.session_id == self.session_id)
@@ -221,6 +136,7 @@ class MemoryManager:
             else:
                 conv = Conversation(
                     session_id=self.session_id,
+                    tenant_id=tenant_id or "default",
                     title=title,
                     model=model,
                     provider=provider,
@@ -228,13 +144,17 @@ class MemoryManager:
                 session.add(conv)
             await session.commit()
 
-    async def get_conversations(self) -> list[dict]:
+    async def get_conversations(self, tenant_id: str = None) -> list[dict]:
         async with async_session() as session:
             # Exclude child sessions (child_{agent_id}_{prefix}_{uuid}) from the list
-            result = await session.execute(
+            query = (
                 select(Conversation)
                 .where(~Conversation.session_id.like("child_%"))
-                .order_by(desc(Conversation.updated_at))
+            )
+            if tenant_id:
+                query = query.where(Conversation.tenant_id == tenant_id)
+            result = await session.execute(
+                query.order_by(desc(Conversation.updated_at))
             )
             return [
                 {

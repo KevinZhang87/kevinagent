@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Check, AlertTriangle, Plus, X, Save, Palette, User, Bot, Brain } from "lucide-react";
+import { Check, AlertTriangle, Plus, X, Save, Palette, User, Bot, Brain, Database } from "lucide-react";
 import { fetchProviders, fetchCurrentConfig, saveSettings, addCustomModel, removeCustomModel, fetchUserSettings, updateUserSettings } from "@/lib/api";
 import { useApp } from "@/contexts/AppContext";
 
@@ -67,6 +67,16 @@ export default function SettingsPage() {
   const [memoryCleanupMinImportance, setMemoryCleanupMinImportance] = useState(0.3);
   const [memoryCleanupIntervalHours, setMemoryCleanupIntervalHours] = useState(12);
 
+  // Memory backend config
+  const [memoryBackend, setMemoryBackend] = useState("sqlite");
+  const [memVectorProvider, setMemVectorProvider] = useState("qdrant");
+  const [memVectorHost, setMemVectorHost] = useState("localhost");
+  const [memVectorPort, setMemVectorPort] = useState(6333);
+  const [memLlmProvider, setMemLlmProvider] = useState("openai");
+  const [memLlmModel, setMemLlmModel] = useState("gpt-4o-mini");
+  const [memEmbedderProvider, setMemEmbedderProvider] = useState("openai");
+  const [memEmbedderModel, setMemEmbedderModel] = useState("text-embedding-3-small");
+
   useEffect(() => { load(); }, []);
 
   const load = async () => {
@@ -91,6 +101,22 @@ export default function SettingsPage() {
             urls[pid] = info.base_url || "";
           }
           setBaseUrls(urls);
+        }
+        // Memory backend config
+        if (cfg.memory_backend) setMemoryBackend(cfg.memory_backend);
+        const mc = cfg.memory_config || {};
+        if (mc.vector_store) {
+          if (mc.vector_store.provider) setMemVectorProvider(mc.vector_store.provider);
+          if (mc.vector_store.host) setMemVectorHost(mc.vector_store.host);
+          if (mc.vector_store.port) setMemVectorPort(mc.vector_store.port);
+        }
+        if (mc.llm) {
+          if (mc.llm.provider) setMemLlmProvider(mc.llm.provider);
+          if (mc.llm.model) setMemLlmModel(mc.llm.model);
+        }
+        if (mc.embedder) {
+          if (mc.embedder.provider) setMemEmbedderProvider(mc.embedder.provider);
+          if (mc.embedder.model) setMemEmbedderModel(mc.embedder.model);
         }
       } catch {}
 
@@ -173,6 +199,12 @@ export default function SettingsPage() {
         default_model: finalModel,
         max_iterations: maxIterations,
         active_providers: activeIds,
+        memory_backend: memoryBackend,
+        memory_config: memoryBackend === "mem0" ? {
+          vector_store: { provider: memVectorProvider, host: memVectorHost, port: memVectorPort },
+          llm: { provider: memLlmProvider, model: memLlmModel },
+          embedder: { provider: memEmbedderProvider, model: memEmbedderModel },
+        } : {},
       });
       if (data.status === "ok") {
         // Save user settings
@@ -442,6 +474,94 @@ export default function SettingsPage() {
                 <input type="number" value={memoryCleanupIntervalHours} onChange={(e) => setMemoryCleanupIntervalHours(Number(e.target.value))} min={1} max={168} style={inputStyle} />
               </div>
             </div>
+          </div>
+        </section>
+
+        {/* Memory Backend */}
+        <section style={{ marginBottom: 40 }}>
+          <h2 style={sectionTitle}><Database size={18} /> Memory Backend</h2>
+          <div style={{ border: "1px solid var(--color-border-default)", borderRadius: 12, padding: 20, display: "flex", flexDirection: "column", gap: 20, background: "var(--color-bg-card)" }}>
+            <div>
+              <label style={{ fontSize: 14, color: "var(--color-text-muted)", display: "block", marginBottom: 10 }}>Backend Type</label>
+              <div style={{ display: "flex", gap: 10 }}>
+                {[
+                  { id: "sqlite", name: "SQLite", desc: "关键词匹配，零外部依赖" },
+                  { id: "mem0", name: "mem0", desc: "语义向量搜索，需要 Qdrant + Embedding 模型" },
+                ].map((b) => (
+                  <button key={b.id} onClick={() => setMemoryBackend(b.id)} style={{
+                    flex: 1, padding: 14, borderRadius: 10, cursor: "pointer", textAlign: "left",
+                    border: memoryBackend === b.id ? "2px solid var(--color-info)" : "1px solid var(--color-border-default)",
+                    background: memoryBackend === b.id ? "rgba(59,130,246,0.06)" : "var(--color-bg-elevated)",
+                  }}>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: "var(--color-text-primary)", marginBottom: 4 }}>{b.name}</div>
+                    <div style={{ fontSize: 12, color: "var(--color-text-muted)" }}>{b.desc}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {memoryBackend === "mem0" && (
+              <>
+                <div style={{ borderTop: "1px solid var(--color-border-default)", paddingTop: 20 }}>
+                  <label style={{ fontSize: 13, fontWeight: 600, color: "var(--color-text-secondary)", display: "block", marginBottom: 14 }}>Vector Store (Qdrant)</label>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+                    <div>
+                      <label style={{ fontSize: 12, color: "var(--color-text-muted)", display: "block", marginBottom: 6 }}>Provider</label>
+                      <select value={memVectorProvider} onChange={(e) => setMemVectorProvider(e.target.value)} style={inputStyle}>
+                        <option value="qdrant">Qdrant</option>
+                        <option value="chroma">ChromaDB</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label style={{ fontSize: 12, color: "var(--color-text-muted)", display: "block", marginBottom: 6 }}>Host</label>
+                      <input type="text" value={memVectorHost} onChange={(e) => setMemVectorHost(e.target.value)} placeholder="localhost" style={inputStyle} />
+                    </div>
+                    <div>
+                      <label style={{ fontSize: 12, color: "var(--color-text-muted)", display: "block", marginBottom: 6 }}>Port</label>
+                      <input type="number" value={memVectorPort} onChange={(e) => setMemVectorPort(Number(e.target.value))} min={1} max={65535} style={inputStyle} />
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ borderTop: "1px solid var(--color-border-default)", paddingTop: 20 }}>
+                  <label style={{ fontSize: 13, fontWeight: 600, color: "var(--color-text-secondary)", display: "block", marginBottom: 14 }}>LLM (记忆提取)</label>
+                  <p style={{ fontSize: 12, color: "var(--color-text-muted)", marginBottom: 12 }}>mem0 使用 LLM 从对话中自动提取值得记住的信息</p>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <div>
+                      <label style={{ fontSize: 12, color: "var(--color-text-muted)", display: "block", marginBottom: 6 }}>Provider</label>
+                      <select value={memLlmProvider} onChange={(e) => setMemLlmProvider(e.target.value)} style={inputStyle}>
+                        {activeProviders.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label style={{ fontSize: 12, color: "var(--color-text-muted)", display: "block", marginBottom: 6 }}>Model</label>
+                      <input type="text" value={memLlmModel} onChange={(e) => setMemLlmModel(e.target.value)} placeholder="gpt-4o-mini" style={inputStyle} />
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ borderTop: "1px solid var(--color-border-default)", paddingTop: 20 }}>
+                  <label style={{ fontSize: 13, fontWeight: 600, color: "var(--color-text-secondary)", display: "block", marginBottom: 14 }}>Embedding Model (向量嵌入)</label>
+                  <p style={{ fontSize: 12, color: "var(--color-text-muted)", marginBottom: 12 }}>将记忆内容转换为向量，用于语义相似度搜索</p>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <div>
+                      <label style={{ fontSize: 12, color: "var(--color-text-muted)", display: "block", marginBottom: 6 }}>Provider</label>
+                      <select value={memEmbedderProvider} onChange={(e) => setMemEmbedderProvider(e.target.value)} style={inputStyle}>
+                        {activeProviders.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label style={{ fontSize: 12, color: "var(--color-text-muted)", display: "block", marginBottom: 6 }}>Model</label>
+                      <input type="text" value={memEmbedderModel} onChange={(e) => setMemEmbedderModel(e.target.value)} placeholder="text-embedding-3-small" style={inputStyle} />
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ padding: "12px 14px", borderRadius: 10, background: "rgba(234,179,8,0.06)", border: "1px solid rgba(234,179,8,0.2)", fontSize: 12, color: "var(--color-text-muted)", lineHeight: 1.6 }}>
+                  ⚠️ 切换到 mem0 后端需要：1) 安装 <code>mem0ai</code> 包 2) 运行 Qdrant 向量数据库 3) 配置有效的 Embedding API Key。保存后需重启服务生效。
+                </div>
+              </>
+            )}
           </div>
         </section>
 

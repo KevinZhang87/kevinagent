@@ -1,7 +1,7 @@
 import logging
 import uuid
 from datetime import datetime, timedelta
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy import select, func, desc
@@ -10,6 +10,8 @@ from app.models.database import async_session, ScheduledTask, TaskExecution
 from app.scheduler.engine import (
     start_task, stop_task, run_task_now, get_running_task_ids, _parse_interval,
 )
+from app.auth.dependencies import get_current_tenant
+from app.auth.schema import TenantContext
 
 logger = logging.getLogger("kevin_agent.tasks")
 
@@ -36,11 +38,11 @@ class TaskUpdate(BaseModel):
 # ── CRUD ───────────────────────────────────────────────────────────
 
 @router.get("")
-async def list_tasks():
+async def list_tasks(ctx: TenantContext = Depends(get_current_tenant)):
     """List all scheduled tasks with status."""
     async with async_session() as session:
         result = await session.execute(
-            select(ScheduledTask).order_by(ScheduledTask.created_at.desc())
+            select(ScheduledTask).where(ScheduledTask.tenant_id == ctx.tenant_id).order_by(ScheduledTask.created_at.desc())
         )
         tasks = result.scalars().all()
         running_ids = get_running_task_ids()
@@ -66,7 +68,7 @@ async def list_tasks():
 
 
 @router.post("")
-async def create_task(request: TaskCreate):
+async def create_task(request: TaskCreate, ctx: TenantContext = Depends(get_current_tenant)):
     """Create a new scheduled task."""
     # Validate interval
     try:
@@ -84,6 +86,7 @@ async def create_task(request: TaskCreate):
     async with async_session() as session:
         task = ScheduledTask(
             task_id=task_id,
+            tenant_id=ctx.tenant_id,
             name=request.name,
             message=request.message,
             interval=request.interval,
@@ -101,30 +104,40 @@ async def create_task(request: TaskCreate):
 
 
 @router.get("/stats")
-async def get_tasks_stats():
+async def get_tasks_stats(ctx: TenantContext = Depends(get_current_tenant)):
     """Get overall scheduler statistics."""
     async with async_session() as session:
         total_tasks = (await session.execute(
-            select(func.count(ScheduledTask.id))
+            select(func.count(ScheduledTask.id)).where(ScheduledTask.tenant_id == ctx.tenant_id)
         )).scalar() or 0
 
         active_tasks = (await session.execute(
-            select(func.count(ScheduledTask.id)).where(ScheduledTask.is_active == True)  # noqa: E712
+            select(func.count(ScheduledTask.id)).where(ScheduledTask.is_active == True, ScheduledTask.tenant_id == ctx.tenant_id)  # noqa: E712
         )).scalar() or 0
 
-        total_executions = (await session.execute(
-            select(func.count(TaskExecution.id))
-        )).scalar() or 0
+        # Get task IDs for this tenant to scope executions
+        task_ids_result = await session.execute(
+            select(ScheduledTask.task_id).where(ScheduledTask.tenant_id == ctx.tenant_id)
+        )
+        task_ids = [r[0] for r in task_ids_result]
 
-        failed_executions = (await session.execute(
-            select(func.count(TaskExecution.id)).where(TaskExecution.status == "failed")
-        )).scalar() or 0
+        total_executions = 0
+        failed_executions = 0
+        recent_executions = 0
+        if task_ids:
+            total_executions = (await session.execute(
+                select(func.count(TaskExecution.id)).where(TaskExecution.task_id.in_(task_ids))
+            )).scalar() or 0
 
-        # Recent executions (last 24h)
-        since = datetime.utcnow() - timedelta(hours=24)
-        recent_executions = (await session.execute(
-            select(func.count(TaskExecution.id)).where(TaskExecution.started_at >= since)
-        )).scalar() or 0
+            failed_executions = (await session.execute(
+                select(func.count(TaskExecution.id)).where(TaskExecution.status == "failed", TaskExecution.task_id.in_(task_ids))
+            )).scalar() or 0
+
+            # Recent executions (last 24h)
+            since = datetime.utcnow() - timedelta(hours=24)
+            recent_executions = (await session.execute(
+                select(func.count(TaskExecution.id)).where(TaskExecution.started_at >= since, TaskExecution.task_id.in_(task_ids))
+            )).scalar() or 0
 
     running_ids = get_running_task_ids()
 
@@ -139,9 +152,16 @@ async def get_tasks_stats():
 
 
 @router.get("/{task_id}/executions")
-async def get_task_executions(task_id: str, limit: int = 20):
+async def get_task_executions(task_id: str, limit: int = 20, ctx: TenantContext = Depends(get_current_tenant)):
     """Get execution history for a task."""
     async with async_session() as session:
+        # Verify the task belongs to this tenant
+        task_result = await session.execute(
+            select(ScheduledTask).where(ScheduledTask.task_id == task_id, ScheduledTask.tenant_id == ctx.tenant_id)
+        )
+        if not task_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Task not found")
+
         result = await session.execute(
             select(TaskExecution)
             .where(TaskExecution.task_id == task_id)
@@ -167,11 +187,11 @@ async def get_task_executions(task_id: str, limit: int = 20):
 
 
 @router.patch("/{task_id}")
-async def update_task(task_id: str, request: TaskUpdate):
+async def update_task(task_id: str, request: TaskUpdate, ctx: TenantContext = Depends(get_current_tenant)):
     """Update a scheduled task."""
     async with async_session() as session:
         result = await session.execute(
-            select(ScheduledTask).where(ScheduledTask.task_id == task_id)
+            select(ScheduledTask).where(ScheduledTask.task_id == task_id, ScheduledTask.tenant_id == ctx.tenant_id)
         )
         task = result.scalar_one_or_none()
         if not task:
@@ -219,8 +239,16 @@ async def update_task(task_id: str, request: TaskUpdate):
 
 
 @router.delete("/{task_id}")
-async def delete_task(task_id: str):
+async def delete_task(task_id: str, ctx: TenantContext = Depends(get_current_tenant)):
     """Delete a scheduled task."""
+    # Verify task belongs to this tenant
+    async with async_session() as session:
+        result = await session.execute(
+            select(ScheduledTask).where(ScheduledTask.task_id == task_id, ScheduledTask.tenant_id == ctx.tenant_id)
+        )
+        if not result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Task not found")
+
     stop_task(task_id)
     async with async_session() as session:
         from sqlalchemy import delete as sql_delete
@@ -228,13 +256,21 @@ async def delete_task(task_id: str):
         await session.execute(sql_delete(TaskExecution).where(TaskExecution.task_id == task_id))
         await session.commit()
 
-    logger.info("Task deleted: %s", task_id)
+    logger.info("Task deleted: %s (tenant=%s)", task_id, ctx.tenant_id)
     return {"status": "deleted"}
 
 
 @router.post("/{task_id}/run")
-async def trigger_task(task_id: str):
+async def trigger_task(task_id: str, ctx: TenantContext = Depends(get_current_tenant)):
     """Trigger a one-off immediate execution of a task."""
+    # Verify task belongs to this tenant
+    async with async_session() as session:
+        result = await session.execute(
+            select(ScheduledTask).where(ScheduledTask.task_id == task_id, ScheduledTask.tenant_id == ctx.tenant_id)
+        )
+        if not result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Task not found")
+
     try:
         await run_task_now(task_id)
         return {"status": "triggered", "task_id": task_id}
@@ -245,11 +281,12 @@ async def trigger_task(task_id: str):
 
 
 @router.post("/reset-agents")
-async def reset_stuck_agents():
+async def reset_stuck_agents(ctx: TenantContext = Depends(get_current_tenant)):
     """Reset all agents stuck in 'thinking' status to 'idle'."""
     from app.core.agent import agent_manager
     reset_count = 0
-    for agent_id, agent in agent_manager._agents.items():
+    tenant_agents = agent_manager.get_tenant_agents(ctx.tenant_id)
+    for agent_id, agent in tenant_agents.items():
         if agent.status == "thinking":
             agent.status = "idle"
             agent.current_task = ""
@@ -260,7 +297,10 @@ async def reset_stuck_agents():
                 from sqlalchemy import update as sql_update
                 async with async_session() as session:
                     await session.execute(
-                        sql_update(AgentState).where(AgentState.agent_id == agent_id).values(
+                        sql_update(AgentState).where(
+                            AgentState.agent_id == agent_id,
+                            AgentState.tenant_id == ctx.tenant_id,
+                        ).values(
                             status="idle", current_task=""
                         )
                     )

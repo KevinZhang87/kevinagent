@@ -56,11 +56,11 @@ async def _execute_task(task_record: ScheduledTask):
                 )
             else:
                 # Fallback: create with defaults
-                from app.config import default_provider, default_model
+                import app.config as cfg
                 agent = await agent_manager.create_agent(
                     agent_id=agent_id,
-                    provider=default_provider,
-                    model=default_model,
+                    provider=cfg.default_provider,
+                    model=cfg.default_model,
                 )
             logger.info("Agent '%s' auto-created (provider=%s, model=%s)",
                         agent_id, agent.provider_name, agent.model)

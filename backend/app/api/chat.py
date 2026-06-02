@@ -4,7 +4,7 @@ import base64
 import logging
 import os
 import tempfile
-from fastapi import APIRouter, WebSocket, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, WebSocket, HTTPException, UploadFile, File, Form, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -13,6 +13,8 @@ from app.models.database import async_session, Message as MessageModel
 from app.core.agent import agent_manager
 from app.core.memory import MemoryManager
 from app.websocket.handler import ws_manager
+from app.auth.dependencies import get_current_tenant
+from app.auth.schema import TenantContext
 
 logger = logging.getLogger("kevin_agent.chat")
 
@@ -38,13 +40,13 @@ class ChatWithAttachmentsRequest(BaseModel):
 
 
 @router.post("")
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, ctx: TenantContext = Depends(get_current_tenant)):
     """Send a message and get a streaming response."""
     target_agent_id = request.agent_id or "main"
-    logger.info("Chat request: session=%s agent=%s provider=%s model=%s msg_len=%d",
+    logger.info("Chat request: session=%s agent=%s provider=%s model=%s tenant=%s msg_len=%d",
                 request.session_id[:8] if request.session_id else "new",
-                target_agent_id, request.provider, request.model, len(request.message))
-    agent = agent_manager.get_agent(target_agent_id)
+                target_agent_id, request.provider, request.model, ctx.tenant_id, len(request.message))
+    agent = agent_manager.get_agent(target_agent_id, tenant_id=ctx.tenant_id)
     if not agent:
         # Auto-create agent from database or with defaults
         if target_agent_id == "main":
@@ -53,13 +55,14 @@ async def chat(request: ChatRequest):
                 provider=request.provider,
                 model=request.model,
                 session_id=request.session_id,
+                tenant_id=ctx.tenant_id,
             )
         else:
             from app.models.database import AgentState, async_session
             from sqlalchemy import select
             async with async_session() as session:
                 result = await session.execute(
-                    select(AgentState).where(AgentState.agent_id == target_agent_id)
+                    select(AgentState).where(AgentState.agent_id == target_agent_id, AgentState.tenant_id == ctx.tenant_id)
                 )
                 state = result.scalar_one_or_none()
             if state:
@@ -68,6 +71,7 @@ async def chat(request: ChatRequest):
                     provider=state.provider,
                     model=state.model,
                     session_id=request.session_id,
+                    tenant_id=ctx.tenant_id,
                 )
             else:
                 raise HTTPException(status_code=404, detail=f"Agent '{target_agent_id}' not found")
@@ -76,6 +80,9 @@ async def chat(request: ChatRequest):
         from app.llm.registry import get_provider
         effective_provider = request.provider or agent.provider_name
         effective_model = request.model or agent.model
+        # Normalize model name: strip "provider/" prefix (e.g. "deepseek/deepseek-v4-flash" -> "deepseek-v4-flash")
+        if "/" in effective_model:
+            effective_model = effective_model.split("/", 1)[1]
         if agent.provider_name != effective_provider or agent.model != effective_model:
             logger.info("Agent model updated: %s/%s -> %s/%s",
                         agent.provider_name, agent.model, effective_provider, effective_model)
@@ -87,7 +94,10 @@ async def chat(request: ChatRequest):
                 from sqlalchemy import update as sql_update
                 async with async_session() as db_session:
                     await db_session.execute(
-                        sql_update(AgentState).where(AgentState.agent_id == target_agent_id).values(
+                        sql_update(AgentState).where(
+                            AgentState.agent_id == target_agent_id,
+                            AgentState.tenant_id == ctx.tenant_id,
+                        ).values(
                             provider=effective_provider, model=effective_model
                         )
                     )
@@ -111,6 +121,12 @@ async def chat(request: ChatRequest):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+async def _cancel_agent_on_disconnect(agent, agent_id):
+    """Helper to cancel agent when SSE stream is cancelled."""
+    agent.cancel()
+    logger.info("Agent %s cancelled due to client disconnect", agent_id)
+
+
 @router.post("/upload")
 async def chat_with_upload(
     message: str = Form(""),
@@ -119,10 +135,11 @@ async def chat_with_upload(
     model: str = Form(""),
     agent_id: str = Form(""),
     files: list[UploadFile] = File(default=[]),
+    ctx: TenantContext = Depends(get_current_tenant),
 ):
     """Send a message with file attachments and get a streaming response."""
     target_agent_id = agent_id or "main"
-    logger.info("Chat upload: session=%s agent=%s files=%d", session_id[:8] if session_id else "new", target_agent_id, len(files))
+    logger.info("Chat upload: session=%s agent=%s files=%d tenant=%s", session_id[:8] if session_id else "new", target_agent_id, len(files), ctx.tenant_id)
 
     # Process attachments
     attachments = []
@@ -169,7 +186,7 @@ async def chat_with_upload(
             })
 
     # Get or create agent
-    agent = agent_manager.get_agent(target_agent_id)
+    agent = agent_manager.get_agent(target_agent_id, tenant_id=ctx.tenant_id)
     if not agent:
         if target_agent_id == "main":
             agent = await agent_manager.create_agent(
@@ -177,13 +194,14 @@ async def chat_with_upload(
                 provider=provider,
                 model=model,
                 session_id=session_id,
+                tenant_id=ctx.tenant_id,
             )
         else:
             from app.models.database import AgentState, async_session
             from sqlalchemy import select
             async with async_session() as session:
                 result = await session.execute(
-                    select(AgentState).where(AgentState.agent_id == target_agent_id)
+                    select(AgentState).where(AgentState.agent_id == target_agent_id, AgentState.tenant_id == ctx.tenant_id)
                 )
                 state = result.scalar_one_or_none()
             if state:
@@ -192,6 +210,7 @@ async def chat_with_upload(
                     provider=state.provider,
                     model=state.model,
                     session_id=session_id,
+                    tenant_id=ctx.tenant_id,
                 )
             else:
                 raise HTTPException(status_code=404, detail=f"Agent '{target_agent_id}' not found")
@@ -199,6 +218,9 @@ async def chat_with_upload(
         from app.llm.registry import get_provider
         effective_provider = provider or agent.provider_name
         effective_model = model or agent.model
+        # Normalize model name: strip "provider/" prefix
+        if "/" in effective_model:
+            effective_model = effective_model.split("/", 1)[1]
         if agent.provider_name != effective_provider or agent.model != effective_model:
             agent.provider_name = effective_provider
             agent.model = effective_model
@@ -209,7 +231,10 @@ async def chat_with_upload(
                 from sqlalchemy import update as sql_update
                 async with async_session() as db_session:
                     await db_session.execute(
-                        sql_update(AgentState).where(AgentState.agent_id == target_agent_id).values(
+                        sql_update(AgentState).where(
+                            AgentState.agent_id == target_agent_id,
+                            AgentState.tenant_id == ctx.tenant_id,
+                        ).values(
                             provider=effective_provider, model=effective_model
                         )
                     )
@@ -222,10 +247,13 @@ async def chat_with_upload(
             async for chunk in agent.chat(message, attachments=attachments):
                 data = chunk.model_dump()
                 yield f"data: {json.dumps(data)}\n\n"
+        except asyncio.CancelledError:
+            logger.info("SSE stream cancelled (client disconnected), cancelling agent %s", target_agent_id)
+            agent.cancel()
+            return
         except Exception as e:
             logger.error("Stream error: %s", e)
             error_chunk = StreamChunk(type="error", content=f"Stream error: {str(e)}", agent_id=target_agent_id)
-            error_chunk = StreamChunk(type="error", content=f"Stream error: {str(e)}", agent_id="main")
             yield f"data: {json.dumps(error_chunk.model_dump())}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -252,11 +280,11 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
     try:
         # Try OpenAI Whisper API
-        from app.config import default_provider, default_model
+        import app.config as cfg
         from app.llm.registry import get_provider
 
-        provider_name = default_provider
-        llm = get_provider(provider_name, default_model)
+        provider_name = cfg.default_provider
+        llm = get_provider(provider_name, cfg.default_model)
 
         if hasattr(llm, 'transcribe'):
             text = await llm.transcribe(att_path)
@@ -288,7 +316,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
 
 @router.post("/sessions")
-async def create_session(request: SessionCreateRequest = None):
+async def create_session(request: SessionCreateRequest = None, ctx: TenantContext = Depends(get_current_tenant)):
     """Create a new chat session."""
     req = request or SessionCreateRequest()
     session_id = str(uuid.uuid4())
@@ -297,16 +325,17 @@ async def create_session(request: SessionCreateRequest = None):
         title=req.title,
         model=req.model,
         provider=req.provider,
+        tenant_id=ctx.tenant_id,
     )
-    logger.info("Session created: %s", session_id[:8])
+    logger.info("Session created: %s (tenant=%s)", session_id[:8], ctx.tenant_id)
     return {"session_id": session_id, "title": req.title}
 
 
 @router.get("/sessions")
-async def list_sessions():
-    """List all chat sessions."""
+async def list_sessions(ctx: TenantContext = Depends(get_current_tenant)):
+    """List all chat sessions for this tenant."""
     memory = MemoryManager("")
-    conversations = await memory.get_conversations()
+    conversations = await memory.get_conversations(tenant_id=ctx.tenant_id)
     # Strip unnecessary data to reduce response size
     slim_sessions = [
         {
@@ -323,11 +352,19 @@ async def list_sessions():
 
 
 @router.get("/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str, limit: int = 100, include_children: bool = True):
+async def get_session_messages(session_id: str, limit: int = 100, include_children: bool = True, ctx: TenantContext = Depends(get_current_tenant)):
     """Get messages for a specific session, optionally including child agent messages."""
     from sqlalchemy import select, or_
+    from app.models.database import Conversation
 
     async with async_session() as session:
+        # Verify the session belongs to this tenant
+        conv_result = await session.execute(
+            select(Conversation).where(Conversation.session_id == session_id, Conversation.tenant_id == ctx.tenant_id)
+        )
+        if not conv_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Session not found")
+
         if include_children:
             # Get messages from parent session AND all child sessions
             # Child sessions are named: child_{agent_id}_{parent_prefix}_{uuid}
@@ -370,16 +407,39 @@ async def get_session_messages(session_id: str, limit: int = 100, include_childr
 
 
 @router.delete("/sessions/{session_id}")
-async def delete_session(session_id: str):
+async def delete_session(session_id: str, ctx: TenantContext = Depends(get_current_tenant)):
     """Delete a chat session and its messages."""
+    from app.models.database import Conversation
+    from sqlalchemy import select
+
+    # Verify the session belongs to this tenant
+    async with async_session() as db_session:
+        conv_result = await db_session.execute(
+            select(Conversation).where(Conversation.session_id == session_id, Conversation.tenant_id == ctx.tenant_id)
+        )
+        if not conv_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Session not found")
+
     memory = MemoryManager(session_id)
     deleted = await memory.delete_conversation(session_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Session not found")
     return {"status": "deleted"}
 
 
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time agent updates."""
-    await ws_manager.handle_connection(websocket)
+    """WebSocket endpoint for real-time agent updates.
+
+    Authenticates via token query parameter: ws://host/api/chat/ws?token=<jwt>
+    """
+    # Extract token from query params
+    token = websocket.query_params.get("token", "")
+    tenant_id = "default"
+    if token:
+        try:
+            from app.auth.service import decode_token
+            payload = decode_token(token)
+            tenant_id = payload.get("tenant_id", "default")
+        except Exception:
+            # Allow connection but with default tenant (backward compat)
+            pass
+    await ws_manager.handle_connection(websocket, tenant_id=tenant_id)

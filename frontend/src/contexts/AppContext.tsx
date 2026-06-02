@@ -58,6 +58,8 @@ interface AppContextValue {
   // WebSocket agents (real-time)
   wsAgents: AgentInfo[];
   wsConnected: boolean;
+  // WebSocket event subscription (agent_created, agent_deleted)
+  onAgentEvent: (callback: (event: string, data: unknown) => void) => () => void;
   // Cached data
   providers: ProviderInfo[];
   agents: AgentInfo[];
@@ -84,7 +86,7 @@ interface AppContextValue {
 const AppContext = createContext<AppContextValue | null>(null);
 
 export function AppProvider({ children }: { children: ReactNode }) {
-  const { agents: wsAgents, connected: wsConnected } = useWebSocket();
+  const { agents: wsAgents, connected: wsConnected, onAgentEvent } = useWebSocket();
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [providerVersion, setProviderVersion] = useState(0);
@@ -162,7 +164,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   return (
     <AppContext.Provider value={{
-      wsAgents, wsConnected, providers, agents, providerVersion, refreshAgents, refreshProviders,
+      wsAgents, wsConnected, onAgentEvent, providers, agents, providerVersion, refreshAgents, refreshProviders,
       chatMessages, setChatMessages, chatSessionId, setChatSessionId,
       chatProvider, setChatProvider, chatModel, setChatModel,
       chatAgentFilter, setChatAgentFilter, chatContextUsage, setChatContextUsage,

@@ -1,17 +1,17 @@
 import logging
 import re
 from typing import Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from app.models.schemas import SkillCreate, SkillUpdate
 from app.skills.manager import SkillManager
 from app.skills.evolver import SkillEvolver
+from app.auth.dependencies import get_current_tenant
+from app.auth.schema import TenantContext
 
 logger = logging.getLogger("kevin_agent.skills")
 
 router = APIRouter(prefix="/api/skills", tags=["skills"])
-skill_manager = SkillManager()
-skill_evolver = SkillEvolver()
 
 
 def parse_markdown_skill(text: str) -> dict | None:
@@ -111,17 +111,19 @@ class SkillImportRequest(BaseModel):
 
 
 @router.get("")
-async def list_skills():
-    """List all skills."""
-    skills = await skill_manager.list_skills()
+async def list_skills(ctx: TenantContext = Depends(get_current_tenant)):
+    """List all skills for this tenant."""
+    sm = SkillManager(tenant_id=ctx.tenant_id)
+    skills = await sm.list_skills()
     return {"skills": skills}
 
 
 @router.post("")
-async def create_skill(request: SkillCreate):
+async def create_skill(request: SkillCreate, ctx: TenantContext = Depends(get_current_tenant)):
     """Create a new skill."""
-    logger.info("Creating skill: %s", request.name)
-    skill = await skill_manager.create_skill(
+    logger.info("Creating skill: %s (tenant=%s)", request.name, ctx.tenant_id)
+    sm = SkillManager(tenant_id=ctx.tenant_id)
+    skill = await sm.create_skill(
         name=request.name,
         description=request.description,
         instruction=request.instruction,
@@ -130,19 +132,21 @@ async def create_skill(request: SkillCreate):
 
 
 @router.get("/{name}")
-async def get_skill(name: str):
+async def get_skill(name: str, ctx: TenantContext = Depends(get_current_tenant)):
     """Get a specific skill."""
-    skill = await skill_manager.get_skill(name)
+    sm = SkillManager(tenant_id=ctx.tenant_id)
+    skill = await sm.get_skill(name)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
     return skill
 
 
 @router.put("/{name}")
-async def update_skill(name: str, request: SkillUpdate):
+async def update_skill(name: str, request: SkillUpdate, ctx: TenantContext = Depends(get_current_tenant)):
     """Update a skill."""
-    logger.info("Updating skill: %s", name)
-    success = await skill_manager.update_skill(
+    logger.info("Updating skill: %s (tenant=%s)", name, ctx.tenant_id)
+    sm = SkillManager(tenant_id=ctx.tenant_id)
+    success = await sm.update_skill(
         name=name,
         description=request.description,
         instruction=request.instruction,
@@ -154,56 +158,57 @@ async def update_skill(name: str, request: SkillUpdate):
 
 
 @router.delete("/{name}")
-async def delete_skill(name: str):
+async def delete_skill(name: str, ctx: TenantContext = Depends(get_current_tenant)):
     """Delete (deactivate) a skill."""
-    logger.info("Deleting skill: %s", name)
-    success = await skill_manager.update_skill(name=name, is_active=False)
+    logger.info("Deleting skill: %s (tenant=%s)", name, ctx.tenant_id)
+    sm = SkillManager(tenant_id=ctx.tenant_id)
+    success = await sm.update_skill(name=name, is_active=False)
     if not success:
         raise HTTPException(status_code=404, detail="Skill not found")
     return {"status": "deleted"}
 
 
 @router.post("/evolve")
-async def evolve_skills():
+async def evolve_skills(ctx: TenantContext = Depends(get_current_tenant)):
     """Trigger automatic skill evolution."""
-    logger.info("Triggering skill evolution")
-    results = await skill_evolver.auto_evolve()
+    logger.info("Triggering skill evolution (tenant=%s)", ctx.tenant_id)
+    evolver = SkillEvolver(tenant_id=ctx.tenant_id)
+    results = await evolver.auto_evolve()
     logger.info("Evolution complete: %d skills evolved", len(results))
     return {"evolved": results}
 
 
 @router.post("/test")
-async def test_skill(request: SkillTestRequest):
+async def test_skill(request: SkillTestRequest, ctx: TenantContext = Depends(get_current_tenant)):
     """Test a skill by getting its context."""
-    skill = await skill_manager.get_skill(request.name)
+    sm = SkillManager(tenant_id=ctx.tenant_id)
+    skill = await sm.get_skill(request.name)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
-    context = await skill_manager.get_skill_context(request.test_input or request.name)
+    context = await sm.get_skill_context(request.test_input or request.name)
     return {"skill": skill, "context": context}
 
 
 @router.post("/import")
-async def import_skills(request: SkillImportRequest):
+async def import_skills(request: SkillImportRequest, ctx: TenantContext = Depends(get_current_tenant)):
     """Import skills from JSON data. Supports batch import with optional overwrite."""
+    sm = SkillManager(tenant_id=ctx.tenant_id)
     results = {"imported": [], "skipped": [], "errors": []}
     for item in request.skills:
         try:
-            # Check if skill already exists
-            existing = await skill_manager.get_skill(item.name)
+            existing = await sm.get_skill(item.name)
             if existing and not request.overwrite:
                 results["skipped"].append({"name": item.name, "reason": "already exists"})
                 continue
             if existing and request.overwrite:
-                # Update existing skill
-                await skill_manager.update_skill(
+                await sm.update_skill(
                     name=item.name,
                     instruction=item.instruction,
                     is_active=True,
                 )
                 results["imported"].append({"name": item.name, "action": "updated"})
             else:
-                # Create new skill
-                await skill_manager.create_skill(
+                await sm.create_skill(
                     name=item.name,
                     description=item.description,
                     instruction=item.instruction,
@@ -218,43 +223,35 @@ async def import_skills(request: SkillImportRequest):
 
 
 @router.get("/export/all")
-async def export_skills():
+async def export_skills(ctx: TenantContext = Depends(get_current_tenant)):
     """Export all skills as JSON data for backup or sharing."""
-    skills = await skill_manager.list_skills()
+    sm = SkillManager(tenant_id=ctx.tenant_id)
+    skills = await sm.list_skills()
     return {"skills": skills, "version": "1.0"}
 
 
 @router.post("/import/markdown")
-async def import_markdown_skill(request: MarkdownImportRequest):
-    """Import a skill from Markdown format with optional YAML frontmatter.
-
-    Format:
-    ---
-    name: skill_name
-    description: Skill description
-    ---
-
-    # Instruction
-    Step-by-step instructions...
-    """
+async def import_markdown_skill(request: MarkdownImportRequest, ctx: TenantContext = Depends(get_current_tenant)):
+    """Import a skill from Markdown format with optional YAML frontmatter."""
+    sm = SkillManager(tenant_id=ctx.tenant_id)
     parsed = parse_markdown_skill(request.content)
     if not parsed:
         raise HTTPException(status_code=400, detail="Could not parse Markdown skill. Need a 'name' in frontmatter or a heading.")
 
     try:
-        existing = await skill_manager.get_skill(parsed["name"])
+        existing = await sm.get_skill(parsed["name"])
         if existing and not request.overwrite:
             return {"status": "skipped", "reason": "already exists", "name": parsed["name"]}
 
         if existing and request.overwrite:
-            await skill_manager.update_skill(
+            await sm.update_skill(
                 name=parsed["name"],
                 instruction=parsed["instruction"],
                 is_active=True,
             )
             return {"status": "updated", "name": parsed["name"], "description": parsed["description"]}
         else:
-            await skill_manager.create_skill(
+            await sm.create_skill(
                 name=parsed["name"],
                 description=parsed["description"],
                 instruction=parsed["instruction"],

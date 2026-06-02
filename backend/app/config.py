@@ -122,6 +122,8 @@ class AppConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     active_providers: list[str] = field(default_factory=lambda: ["openai", "deepseek", "moonshot", "glm", "mimo", "anthropic", "ollama"])
+    memory_backend: str = "sqlite"  # sqlite | mem0
+    memory_config: dict = field(default_factory=dict)  # mem0-specific config (vector_store, llm, embedder)
 
 
 def load_app_config() -> AppConfig:
@@ -133,6 +135,11 @@ def load_app_config() -> AppConfig:
     agent_data = data.get("agent", {})
     log_data = data.get("logging", {})
     active_providers = data.get("active_providers", ["openai", "deepseek", "moonshot", "glm", "mimo", "anthropic", "ollama"])
+
+    # Memory backend config
+    memory_data = data.get("memory", {})
+    memory_backend = get_env("MEMORY_BACKEND", memory_data.get("backend", "sqlite"))
+    memory_config = {k: v for k, v in memory_data.items() if k != "backend"}
 
     db_url = build_database_url(db_data)
 
@@ -164,6 +171,8 @@ def load_app_config() -> AppConfig:
             format=log_data.get("format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"),
         ),
         active_providers=active_providers,
+        memory_backend=memory_backend,
+        memory_config=memory_config,
     )
 
 

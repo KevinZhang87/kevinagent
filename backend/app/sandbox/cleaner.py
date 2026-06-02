@@ -115,14 +115,23 @@ class WorkspaceCleaner:
         self.interval_seconds = interval_hours * 3600
         self._task: asyncio.Task | None = None
 
-    def run_once(self) -> dict:
-        """Run cleanup once and return stats."""
+    def run_once(self, tenant_id: str = None) -> dict:
+        """Run cleanup once and return stats. Optionally scoped to a tenant."""
         stats = {"agent_workspaces": {}, "shared_workspace": {}, "total_deleted": 0, "total_freed_mb": 0.0}
 
+        # Determine root to scan
+        if tenant_id:
+            scan_root = self.root / tenant_id
+        else:
+            scan_root = self.root
+
         # Clean each agent workspace
-        if self.root.exists():
-            for agent_dir in self.root.iterdir():
+        if scan_root.exists():
+            for agent_dir in scan_root.iterdir():
                 if not agent_dir.is_dir():
+                    continue
+                # Skip shared_workspace directory
+                if agent_dir.name == "shared_workspace":
                     continue
                 sandbox_dir = agent_dir / "sandbox"
                 d1, f1 = _cleanup_dir_by_ttl(sandbox_dir, self.ttl_seconds)
@@ -135,7 +144,11 @@ class WorkspaceCleaner:
                     stats["total_freed_mb"] += freed
 
         # Clean shared workspace
-        d, f = _cleanup_dir_by_ttl(self.shared_root, self.shared_ttl_seconds)
+        if tenant_id:
+            shared_root = self.root / tenant_id / "shared_workspace"
+        else:
+            shared_root = self.shared_root
+        d, f = _cleanup_dir_by_ttl(shared_root, self.shared_ttl_seconds)
         if d > 0:
             stats["shared_workspace"] = {"deleted": d, "freed_mb": round(f, 2)}
             stats["total_deleted"] += d
@@ -172,13 +185,20 @@ class WorkspaceCleaner:
             self._task.cancel()
             logger.info("Workspace cleaner stopped")
 
-    def get_workspace_stats(self) -> dict:
-        """Get current workspace disk usage stats."""
+    def get_workspace_stats(self, tenant_id: str = None) -> dict:
+        """Get current workspace disk usage stats. Optionally scoped to a tenant."""
         stats = {"workspaces": {}, "shared_workspace": {"size_mb": 0}}
 
-        if self.root.exists():
-            for agent_dir in self.root.iterdir():
+        if tenant_id:
+            scan_root = self.root / tenant_id
+        else:
+            scan_root = self.root
+
+        if scan_root.exists():
+            for agent_dir in scan_root.iterdir():
                 if not agent_dir.is_dir():
+                    continue
+                if agent_dir.name == "shared_workspace":
                     continue
                 sandbox_dir = agent_dir / "sandbox"
                 stats["workspaces"][agent_dir.name] = {
@@ -186,9 +206,13 @@ class WorkspaceCleaner:
                     "file_count": sum(1 for _ in sandbox_dir.rglob("*") if _.is_file()) if sandbox_dir.exists() else 0,
                 }
 
+        if tenant_id:
+            shared_root = self.root / tenant_id / "shared_workspace"
+        else:
+            shared_root = self.shared_root
         stats["shared_workspace"] = {
-            "size_mb": round(_dir_size_mb(self.shared_root), 2),
-            "file_count": sum(1 for _ in self.shared_root.rglob("*") if _.is_file()) if self.shared_root.exists() else 0,
+            "size_mb": round(_dir_size_mb(shared_root), 2),
+            "file_count": sum(1 for _ in shared_root.rglob("*") if _.is_file()) if shared_root.exists() else 0,
         }
 
         return stats

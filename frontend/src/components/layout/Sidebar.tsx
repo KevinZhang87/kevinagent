@@ -1,8 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { MessageSquare, GitBranch, Zap, Settings, BarChart3, Clock, Brain } from "lucide-react";
+import { usePathname, useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import { MessageSquare, GitBranch, Zap, Settings, BarChart3, Clock, Brain, LogIn, LogOut, User } from "lucide-react";
+import { getAuthToken, clearAuthToken } from "@/lib/api";
 
 const navItems = [
   { href: "/", icon: MessageSquare, label: "Chat" },
@@ -14,8 +16,31 @@ const navItems = [
   { href: "/settings", icon: Settings, label: "Settings" },
 ];
 
+/** 应用侧边栏导航组件，负责渲染顶部品牌标识、主导航菜单以及底部用户状态区域（已登录显示头像与登出，未登录显示登录入口） */
 export function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [userEmail, setUserEmail] = useState("");
+
+  useEffect(() => {
+    const token = getAuthToken();
+    setIsAuthenticated(!!token);
+    try {
+      const info = localStorage.getItem("user_info");
+      if (info) {
+        const parsed = JSON.parse(info);
+        setUserEmail(parsed.email || parsed.tenant_id?.slice(0, 12) || "");
+      }
+    } catch {}
+  }, []);
+
+  const handleLogout = () => {
+    clearAuthToken();
+    localStorage.removeItem("user_info");
+    setIsAuthenticated(false);
+    router.push("/login");
+  };
 
   return (
     <aside
@@ -57,11 +82,74 @@ export function Sidebar() {
       </nav>
 
       <div style={{ padding: "16px 20px", borderTop: "1px solid var(--color-border-default)" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--color-text-muted)" }}>
-          <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--color-success)", boxShadow: "0 0 8px rgba(34,197,94,0.4)" }} />
-          System Online
-        </div>
-        <div style={{ fontSize: 11, color: "var(--color-text-muted)", marginTop: 6, opacity: 0.6 }}>
+        {isAuthenticated ? (
+          <div
+            onClick={handleLogout}
+            title="Click to logout"
+            style={{
+              display: "flex", alignItems: "center", gap: 12, cursor: "pointer",
+              padding: "6px 4px", borderRadius: 10, transition: "background 0.15s",
+            }}
+            onMouseEnter={e => (e.currentTarget.style.background = "var(--color-bg-elevated, rgba(255,255,255,0.05))")}
+            onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+          >
+            <div style={{
+              width: 36, height: 36, borderRadius: "50%", flexShrink: 0,
+              background: "var(--color-bg-elevated)",
+              border: "1.5px solid var(--color-border-hover)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 14, fontWeight: 600, color: "var(--color-text-secondary)",
+              letterSpacing: -0.5, position: "relative", overflow: "hidden",
+            }}>
+              <div style={{
+                position: "absolute", inset: 0,
+                background: "radial-gradient(ellipse at 30% 20%, rgba(255,255,255,0.06), transparent 60%)",
+              }} />
+              <span style={{ position: "relative" }}>
+                {userEmail ? userEmail[0].toUpperCase() : "U"}
+              </span>
+            </div>
+            <div style={{ overflow: "hidden", flex: 1 }}>
+              <div style={{
+                fontSize: 13, fontWeight: 500, color: "var(--color-text-primary)",
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+              }}>
+                {userEmail || "User"}
+              </div>
+              <div style={{ fontSize: 11, color: "var(--color-text-muted)", marginTop: 1 }}>
+                Click to logout
+              </div>
+            </div>
+          </div>
+        ) : (
+          <Link
+            href="/login"
+            style={{
+              display: "flex", alignItems: "center", gap: 12, textDecoration: "none",
+              padding: "6px 4px", borderRadius: 10, transition: "background 0.15s",
+            }}
+            onMouseEnter={e => (e.currentTarget.style.background = "var(--color-bg-elevated, rgba(255,255,255,0.05))")}
+            onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+          >
+            <div style={{
+              width: 36, height: 36, borderRadius: "50%", flexShrink: 0,
+              background: "var(--color-bg-elevated, #2a2a2a)",
+              border: "2px dashed var(--color-border-default, #444)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}>
+              <User size={16} style={{ color: "var(--color-text-muted)", opacity: 0.6 }} />
+            </div>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 500, color: "var(--color-text-primary)" }}>
+                Login / Register
+              </div>
+              <div style={{ fontSize: 11, color: "var(--color-text-muted)", marginTop: 1 }}>
+                Sign in to your account
+              </div>
+            </div>
+          </Link>
+        )}
+        <div style={{ fontSize: 11, color: "var(--color-text-muted)", marginTop: 10, opacity: 0.6 }}>
           v0.2.0
         </div>
       </div>

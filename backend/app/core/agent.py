@@ -58,6 +58,16 @@ You do NOT do these tasks yourself. You DELEGATE to specialists.
 3. **When in doubt, delegate.** It's better to over-delegate than to under-delegate.
 4. **NEVER do a specialist's work yourself.** If a sub-agent can do it, delegate.
 
+## Memory Management
+- **ALWAYS use memory_save** when the user tells you their role, preferences, requirements, or any information they want you to remember.
+- Examples of what to save:
+  - User sets your role/persona: "你是一个资深前端工程师" → save with memory_type="user_preference"
+  - User sets requirements: "回答要简洁" → save with memory_type="user_preference"
+  - User shares preferences: "我喜欢用TypeScript" → save with memory_type="user_preference"
+  - Important facts from conversation → save with memory_type="general"
+- Use appropriate importance scores: critical=0.9, important=0.7, general=0.5
+- Check relevant memories at the start of each conversation for context
+
 ## File System
 - Your sandbox: isolated workspace for your own files (sandbox/)
 - Shared workspace: shared across all agents (shared_workspace/)
@@ -103,23 +113,30 @@ _AGENT_TOOL_WHITELIST: dict[str, set[str]] = {
 }
 
 
-def _get_agent_tools(agent_id: str) -> list[dict] | None:
+def _get_agent_tools(agent_id: str, stored_tools: list[str] = None) -> list[dict] | None:
     """Get the appropriate tool set for an agent.
 
     - 'main' orchestrator: all tools (12 tools, ~1400 tokens)
-    - sub-agents: filtered subset from agent_config.json or built-in whitelist
+    - sub-agents: filtered subset from DB, agent_config.json, or built-in whitelist
     - unknown agents: all tools (safe fallback)
 
-    Each agent in agent_config.json can specify a "tools" list to override
-    the default tool set, e.g.:
-        "tools": ["web_search", "file_read", "shared_write"]
+    Resolution order:
+    1. main -> all tools
+    2. stored_tools (from DB AgentState.tools) if provided
+    3. _AGENT_TOOL_WHITELIST hardcoded
+    4. agent_config.json "tools" field
+    5. fallback -> all tools
 
     Returns None if no tools should be used.
     """
     if agent_id == "main":
         return tool_registry.get_all_schemas()
 
-    # Check agent_config.json for per-agent tool whitelist
+    # Priority: DB-stored tools (from UI configuration)
+    if stored_tools:
+        return [t for t in tool_registry.get_all_schemas() if t["name"] in set(stored_tools)]
+
+    # Check hardcoded whitelist, then agent_config.json
     whitelist = _AGENT_TOOL_WHITELIST.get(agent_id)
     try:
         config_path = Path(__file__).parent.parent.parent / "agent_config.json"
@@ -151,16 +168,26 @@ class Agent:
         session_id: str = "",
         on_status_change: Optional[Callable[[str, str], Awaitable[None]]] = None,
         system_prompt: str = "",
+        tenant_id: str = "default",
+        stored_tools: list[str] = None,
     ):
         self.agent_id = agent_id
+        self.tenant_id = tenant_id
         self.provider_name = provider or cfg.default_provider
-        self.model = model or cfg.default_model
+        self.model = (model or cfg.default_model)
+        # Normalize model name: strip "provider/" prefix if present
+        # e.g. "deepseek/deepseek-v4-flash" -> "deepseek-v4-flash"
+        if "/" in self.model:
+            self.model = self.model.split("/", 1)[1]
         self.session_id = session_id or str(uuid.uuid4())
         self.llm: BaseLLMProvider = get_provider(provider, model, api_key)
-        self.memory = MemoryManager(self.session_id)
+        self.memory = MemoryManager(self.session_id, tenant_id=self.tenant_id)
         self.on_status_change = on_status_change
         self.system_prompt = system_prompt  # Agent-specific system prompt
+        self._stored_tools = stored_tools  # Tool whitelist from DB
         self.status = "idle"
+        self._abort_event: asyncio.Event = asyncio.Event()  # Cancel signal for in-flight chat()
+        self._busy: bool = False  # Concurrency lock: prevents overlapping chat() calls
         self.current_task = ""
         self.max_iterations = cfg.app_config.agent.max_iterations
         self.context_window_size = cfg.app_config.agent.context_window_size
@@ -172,11 +199,30 @@ class Agent:
         self.last_context_usage: dict = {}
         logger.info("Agent created: id=%s provider=%s model=%s session=%s", agent_id, provider, model, self.session_id[:8])
 
+    def cancel(self):
+        """Request cancellation of the current chat() execution."""
+        self._abort_event.set()
+        # Update status immediately so the UI reflects the cancellation request
+        if self.status in ("thinking", "executing"):
+            try:
+                asyncio.get_running_loop().create_task(self._update_status("cancelled", "Cancellation requested"))
+            except RuntimeError:
+                pass
+        logger.info("Cancel requested for agent %s", self.agent_id)
+
+    def _check_cancelled(self) -> bool:
+        """Check if cancellation has been requested."""
+        return self._abort_event.is_set()
+
+    def _reset_cancel(self):
+        """Reset the cancel signal for a new chat() call."""
+        self._abort_event.clear()
+
     async def _update_status(self, status: str, task: str = ""):
         self.status = status
         self.current_task = task
         # Debounce DB writes - only write for significant status changes
-        if status in ("thinking", "executing", "idle", "error"):
+        if status in ("thinking", "executing", "idle", "error", "cancelled"):
             try:
                 await asyncio.wait_for(self._save_status_to_db(status, task), timeout=5)
             except (asyncio.TimeoutError, Exception) as e:
@@ -192,7 +238,7 @@ class Agent:
         async with async_session() as session:
             from sqlalchemy import select
             result = await session.execute(
-                select(AgentState).where(AgentState.agent_id == self.agent_id)
+                select(AgentState).where(AgentState.agent_id == self.agent_id, AgentState.tenant_id == self.tenant_id)
             )
             state = result.scalar_one_or_none()
             if state:
@@ -202,6 +248,7 @@ class Agent:
             else:
                 state = AgentState(
                     agent_id=self.agent_id,
+                    tenant_id=self.tenant_id,
                     status=status,
                     current_task=task,
                     model=self.model,
@@ -305,7 +352,9 @@ Conversation to summarize:
         async with async_session() as session:
             from sqlalchemy import select
 
-            result = await session.execute(select(UserSettings))
+            result = await session.execute(
+                select(UserSettings).where(UserSettings.tenant_id == self.tenant_id)
+            )
             return {item.key: item.value for item in result.scalars()}
 
     async def _save_user_setting(self, key: str, value: str):
@@ -313,13 +362,13 @@ Conversation to summarize:
             from sqlalchemy import select
 
             result = await session.execute(
-                select(UserSettings).where(UserSettings.key == key)
+                select(UserSettings).where(UserSettings.key == key, UserSettings.tenant_id == self.tenant_id)
             )
             setting = result.scalar_one_or_none()
             if setting:
                 setting.value = value
             else:
-                session.add(UserSettings(key=key, value=value))
+                session.add(UserSettings(key=key, value=value, tenant_id=self.tenant_id))
             await session.commit()
 
     async def _maintain_memories_if_needed(self):
@@ -354,6 +403,65 @@ Conversation to summarize:
         except Exception as e:
             logger.debug("Auto memory maintenance skipped: %s", e)
 
+    async def _cleanup_ephemeral_agents(self):
+        """Remove ephemeral child agents created during this chat session."""
+        try:
+            from sqlalchemy import select as sel, delete as sql_delete
+            from app.models.database import Message, Memory
+
+            async with async_session() as session:
+                # Find ephemeral agents whose parent is this agent
+                result = await session.execute(
+                    sel(AgentState).where(
+                        AgentState.parent_agent_id == self.agent_id,
+                        AgentState.ephemeral == True,
+                        AgentState.tenant_id == self.tenant_id,
+                    )
+                )
+                ephemeral_agents = result.scalars().all()
+
+                if not ephemeral_agents:
+                    return
+
+                deleted_ids = []
+                for agent_state in ephemeral_agents:
+                    aid = agent_state.agent_id
+
+                    # Remove from in-memory dicts
+                    tenant_agents = agent_manager.get_tenant_agents(self.tenant_id)
+                    tenant_agents.pop(aid, None)
+                    agent_manager._agents.pop(aid, None)
+
+                    # Delete messages and memories
+                    await session.execute(sql_delete(Message).where(Message.agent_id == aid))
+                    await session.execute(sql_delete(Memory).where(Memory.session_id.like(f"%{aid}%")))
+
+                    # Delete agent state
+                    await session.execute(sql_delete(AgentState).where(
+                        AgentState.agent_id == aid,
+                        AgentState.tenant_id == self.tenant_id,
+                    ))
+                    deleted_ids.append(aid)
+
+                    # Delete workspace
+                    import shutil
+                    from pathlib import Path
+                    workspaces_dir = Path(__file__).parent.parent.parent / "workspaces"
+                    agent_workspace = workspaces_dir / self.tenant_id / aid
+                    if agent_workspace.exists():
+                        try:
+                            shutil.rmtree(agent_workspace)
+                        except Exception:
+                            pass
+
+                    # Broadcast deletion to frontend
+                    await agent_manager.broadcast_agent_deleted(aid, self.tenant_id)
+
+                await session.commit()
+                logger.info("Cleaned up %d ephemeral agents: %s", len(deleted_ids), deleted_ids)
+        except Exception as e:
+            logger.debug("Ephemeral agent cleanup skipped: %s", e)
+
     async def chat(self, user_message: str, attachments: list[dict] = None, session_id: str = None) -> AsyncIterator[StreamChunk]:
         """Process a user message and yield streaming responses.
 
@@ -368,13 +476,22 @@ Conversation to summarize:
         """
         logger.info("Chat request: agent=%s message_len=%d attachments=%d",
                      self.agent_id, len(user_message), len(attachments or []))
+
+        # Concurrency guard: reject if already processing
+        if self._busy:
+            yield StreamChunk(type="error", content="Agent is busy processing another request. Please wait or cancel the current task.", agent_id=self.agent_id)
+            yield StreamChunk(type="done", content="", agent_id=self.agent_id)
+            return
+
+        self._busy = True
+        self._reset_cancel()  # Clear any previous cancel signal
         await self._update_status("thinking", user_message[:100])
 
         # Use temporary memory manager if session_id is overridden (for task execution)
         from app.core.memory import MemoryManager
         original_memory = self.memory
         if session_id and session_id != self.session_id:
-            self.memory = MemoryManager(session_id)
+            self.memory = MemoryManager(session_id, tenant_id=self.tenant_id)
 
         # Build enriched message with attachment context
         enriched_message = user_message
@@ -405,6 +522,7 @@ Conversation to summarize:
                 title=user_message[:50] if len(user_message) > 50 else user_message,
                 model=self.model,
                 provider=self.provider_name,
+                tenant_id=self.tenant_id,
             )
         )
         history_task = asyncio.create_task(
@@ -439,7 +557,7 @@ Conversation to summarize:
         if not skill_context:
             try:
                 from app.skills.manager import SkillManager
-                sm = SkillManager(agent_id=self.agent_id)
+                sm = SkillManager(agent_id=self.agent_id, tenant_id=self.tenant_id)
                 skill_context, matched_skill_names = await sm.get_skill_context(user_message)
                 if skill_context and len(skill_context) > 300:
                     skill_context = skill_context[:300] + "..."
@@ -514,11 +632,21 @@ Conversation to summarize:
         tool_error_count = 0  # Count of tool execution failures
 
         # Determine which tools this agent needs
-        agent_tools = _get_agent_tools(self.agent_id)
+        agent_tools = _get_agent_tools(self.agent_id, stored_tools=self._stored_tools)
         last_had_tool_calls = True  # Start with tools on first iteration
 
         while iteration < self.max_iterations:
             iteration += 1
+
+            # Check for cancellation
+            if self._check_cancelled():
+                logger.info("Agent %s cancelled at iteration %d", self.agent_id, iteration)
+                self._busy = False
+                await self._update_status("idle", "")
+                yield StreamChunk(type="status", content="Cancelled by user", agent_id=self.agent_id)
+                yield StreamChunk(type="done", content="", agent_id=self.agent_id)
+                return
+
             await self._update_status("thinking", f"Iteration {iteration}")
 
             # OPTIMIZATION: Only send tools on first iteration or after tool results.
@@ -537,6 +665,15 @@ Conversation to summarize:
                 logger.debug("LLM response: content_len=%d tool_calls=%d tokens=%d", len(response.content), len(response.tool_calls), response.total_tokens)
                 # Track whether this response had tool calls (for tool-sending optimization)
                 last_had_tool_calls = bool(response.tool_calls)
+
+                # Check for cancellation immediately after LLM returns
+                if self._check_cancelled():
+                    logger.info("Agent %s cancelled after LLM response at iteration %d", self.agent_id, iteration)
+                    self._busy = False
+                    await self._update_status("idle", "")
+                    yield StreamChunk(type="status", content="Cancelled by user", agent_id=self.agent_id)
+                    yield StreamChunk(type="done", content="", agent_id=self.agent_id)
+                    return
             except asyncio.TimeoutError:
                 logger.error("LLM timeout after 120s, iteration=%d", iteration)
                 last_error_msg = "LLM timeout after 120s"
@@ -635,7 +772,8 @@ Conversation to summarize:
                         exec_task = asyncio.create_task(
                             tool_registry.execute(tool_name, tool_args, agent_id=self.agent_id,
                                                   on_progress=progress_callback,
-                                                  caller_session_id=self.memory.session_id)
+                                                  caller_session_id=self.memory.session_id,
+                                                  tenant_id=self.tenant_id)
                         )
                         # Forward sub-agent progress while execution runs
                         while not exec_task.done():
@@ -660,7 +798,8 @@ Conversation to summarize:
                     else:
                         # Normal tool execution
                         result: ToolResult = await tool_registry.execute(tool_name, tool_args, agent_id=self.agent_id,
-                                                                          caller_session_id=self.memory.session_id)
+                                                                          caller_session_id=self.memory.session_id,
+                                                                          tenant_id=self.tenant_id)
 
                     logger.info("Tool result: %s success=%s output_len=%d", tool_name, result.success, len(result.output))
 
@@ -776,8 +915,13 @@ Conversation to summarize:
             asyncio.create_task(self._maintain_memories_if_needed())
 
         logger.info("Chat complete: agent=%s iterations=%d response_len=%d", self.agent_id, iteration, len(full_response))
+        self._busy = False
         await self._update_status("idle", "")
         yield StreamChunk(type="done", content="", agent_id=self.agent_id)
+
+        # Auto-cleanup ephemeral child agents created during this chat
+        if self.agent_id == "main":
+            asyncio.create_task(self._cleanup_ephemeral_agents())
 
         # Restore original memory manager if we used a temporary one
         if session_id and session_id != self.session_id:
@@ -786,7 +930,7 @@ Conversation to summarize:
     async def _maybe_create_skill(self, response: str):
         """Check if the conversation should be saved as a skill. Runs as background task."""
         from app.skills.manager import SkillManager
-        manager = SkillManager(agent_id=self.agent_id)
+        manager = SkillManager(agent_id=self.agent_id, tenant_id=self.tenant_id)
         try:
             await manager.try_create_from_conversation(self.session_id, response)
         except Exception as e:
@@ -800,7 +944,7 @@ Conversation to summarize:
         """
         try:
             from app.skills.manager import SkillManager
-            sm = SkillManager(agent_id=self.agent_id)
+            sm = SkillManager(agent_id=self.agent_id, tenant_id=self.tenant_id)
             # Build failure context for non-successful usage
             context = None
             if not success and (user_query or error_msg):
@@ -839,7 +983,7 @@ Conversation to summarize:
         """Auto-evolve skills with poor performance. Runs as background task."""
         try:
             from app.skills.evolver import SkillEvolver
-            evolver = SkillEvolver()
+            evolver = SkillEvolver(tenant_id=self.tenant_id)
             await evolver.auto_evolve()
         except Exception as e:
             logger.debug("Auto-evolve check skipped: %s", e)
@@ -850,6 +994,7 @@ Conversation to summarize:
             async with async_session() as session:
                 usage = TokenUsage(
                     session_id=self.session_id,
+                    tenant_id=self.tenant_id,
                     agent_id=self.agent_id,
                     model=self.model,
                     provider=self.provider_name,
@@ -867,11 +1012,16 @@ Conversation to summarize:
 
 
 class AgentManager:
-    """Manages multiple agents and their lifecycle."""
+    """Manages multiple agents and their lifecycle, with tenant isolation.
+
+    Structure: _tenant_agents[tenant_id][agent_id] -> Agent
+    """
 
     def __init__(self):
-        self._agents: dict[str, Agent] = {}
+        self._tenant_agents: dict[str, dict[str, Agent]] = {}  # tenant_id -> {agent_id -> Agent}
         self._ws_callbacks: list[Callable] = []
+        # For backward compatibility, also keep a flat view
+        self._agents: dict[str, Agent] = {}  # DEPRECATED: use get_agent(tenant_id, agent_id)
 
     def add_ws_callback(self, callback: Callable):
         self._ws_callbacks.append(callback)
@@ -887,21 +1037,62 @@ class AgentManager:
             except Exception:
                 pass
 
+    async def broadcast_agent_update_for_tenant(self, agent_id: str, status: str, tenant_id: str):
+        for cb in self._ws_callbacks:
+            try:
+                await cb(agent_id, status, tenant_id)
+            except Exception:
+                pass
+
+    async def broadcast_agent_created(self, agent_data: dict, tenant_id: str):
+        """Broadcast agent_created event to WebSocket clients."""
+        for cb in self._ws_callbacks:
+            try:
+                if hasattr(cb, "__name__") or True:  # call all callbacks
+                    await cb("__agent_created__", "created", tenant_id, agent_data)
+            except Exception:
+                pass
+
+    async def broadcast_agent_deleted(self, agent_id: str, tenant_id: str):
+        """Broadcast agent_deleted event to WebSocket clients."""
+        for cb in self._ws_callbacks:
+            try:
+                await cb("__agent_deleted__", "deleted", tenant_id, {"agent_id": agent_id})
+            except Exception:
+                pass
+
     async def create_agent(
         self,
         agent_id: str = "",
-        provider: str = "openai",
-        model: str = "gpt-4o",
+        provider: str = "",
+        model: str = "",
         api_key: str = "",
         session_id: str = "",
         parent_agent_id: str = "",
         system_prompt: str = "",
+        tenant_id: str = "default",
+        ephemeral: bool = False,
+        description: str = None,
+        capabilities: list = None,
+        tools: list = None,
     ) -> Agent:
         agent_id = agent_id or f"agent_{uuid.uuid4().hex[:8]}"
 
-        # Initialize workspace directory structure
+        # Resolve defaults from config
+        if not provider:
+            provider = cfg.default_provider
+        if not model:
+            model = cfg.default_model
+
+        # Normalize model name: strip "provider/" prefix if present
+        # e.g. "deepseek/deepseek-v4-flash" -> "deepseek-v4-flash"
+        if "/" in model:
+            model = model.split("/", 1)[1]
+            logger.info("Normalized model name: stripped provider prefix -> %s", model)
+
+        # Initialize workspace directory structure (tenant-scoped)
         from app.sandbox.manager import init_agent_workspace
-        init_agent_workspace(agent_id)
+        init_agent_workspace(agent_id, tenant_id=tenant_id)
 
         agent = Agent(
             agent_id=agent_id,
@@ -910,70 +1101,140 @@ class AgentManager:
             api_key=api_key,
             session_id=session_id,
             system_prompt=system_prompt,
+            tenant_id=tenant_id,
             on_status_change=self.broadcast_agent_update,
+            stored_tools=tools,
         )
+
+        # Store in tenant-scoped dict
+        if tenant_id not in self._tenant_agents:
+            self._tenant_agents[tenant_id] = {}
+        self._tenant_agents[tenant_id][agent_id] = agent
+        # Also keep in flat dict for backward compat (tools use agent_manager.get_agent)
         self._agents[agent_id] = agent
 
         # Persist agent state to database (upsert to handle concurrent creation)
         try:
+            import json as _json
             from sqlalchemy.dialects.sqlite import insert as sqlite_insert
             async with async_session() as session:
                 stmt = sqlite_insert(AgentState).values(
                     agent_id=agent_id,
+                    tenant_id=tenant_id,
                     status="idle",
                     current_task="",
                     model=model,
                     provider=provider,
                     parent_agent_id=parent_agent_id or None,
+                    ephemeral=ephemeral,
+                    system_prompt=system_prompt or None,
+                    description=description,
+                    capabilities=_json.dumps(capabilities) if capabilities else None,
+                    tools=_json.dumps(tools) if tools else None,
                 ).on_conflict_do_update(
-                    index_elements=["agent_id"],
-                    set_={"model": model, "provider": provider, "status": "idle"},
+                    index_elements=["tenant_id", "agent_id"],
+                    set_={
+                        "model": model, "provider": provider, "status": "idle", "ephemeral": ephemeral,
+                        "system_prompt": system_prompt or None, "description": description,
+                        "capabilities": _json.dumps(capabilities) if capabilities else None,
+                        "tools": _json.dumps(tools) if tools else None,
+                    },
                 )
                 await session.execute(stmt)
                 await session.commit()
         except Exception as e:
             logger.warning("Failed to persist agent state to DB: %s", e)
 
+        # Broadcast agent_created event to frontend
+        await self.broadcast_agent_created({
+            "agent_id": agent_id,
+            "status": "idle",
+            "model": model,
+            "provider": provider,
+            "parent_agent_id": parent_agent_id or None,
+            "ephemeral": ephemeral,
+        }, tenant_id)
+
         return agent
 
-    def get_agent(self, agent_id: str) -> Agent | None:
+    def get_agent(self, agent_id: str, tenant_id: str = None) -> Agent | None:
+        """Get an agent, optionally scoped to a tenant."""
+        if tenant_id:
+            tenant_agents = self._tenant_agents.get(tenant_id, {})
+            return tenant_agents.get(agent_id)
+        # Fallback: search across all tenants (for backward compat with tools)
         return self._agents.get(agent_id)
 
-    def get_main_agent(self) -> Agent:
-        if "main" not in self._agents:
-            raise RuntimeError("Main agent not initialized")
-        return self._agents["main"]
+    def get_main_agent(self, tenant_id: str = None) -> Agent:
+        if tenant_id:
+            tenant_agents = self._tenant_agents.get(tenant_id, {})
+            if "main" in tenant_agents:
+                return tenant_agents["main"]
+        if "main" in self._agents:
+            return self._agents["main"]
+        raise RuntimeError("Main agent not initialized")
 
-    async def get_all_agent_states(self) -> list[dict]:
+    def get_tenant_agents(self, tenant_id: str) -> dict[str, Agent]:
+        """Get all agents for a specific tenant."""
+        return self._tenant_agents.get(tenant_id, {})
+
+    async def get_all_agent_states(self, tenant_id: str = None) -> list[dict]:
+        """Get all agent states, optionally scoped to a tenant."""
         async with async_session() as session:
             from sqlalchemy import select
-            result = await session.execute(select(AgentState))
-            db_states = {a.agent_id: a for a in result.scalars()}
+            query = select(AgentState)
+            if tenant_id:
+                query = query.where(AgentState.tenant_id == tenant_id)
+            result = await session.execute(query)
+            db_states = {(a.tenant_id or "default", a.agent_id): a for a in result.scalars()}
 
         states = []
-        # Include all DB agents, preferring in-memory values when available
-        for agent_id, a in db_states.items():
-            mem_agent = self._agents.get(agent_id)
-            states.append({
-                "agent_id": a.agent_id,
-                "status": mem_agent.status if mem_agent else a.status,
-                "current_task": mem_agent.current_task if mem_agent else a.current_task,
-                "model": mem_agent.model if mem_agent else a.model,
-                "provider": mem_agent.provider_name if mem_agent else a.provider,
-                "parent_agent_id": a.parent_agent_id,
-            })
+        seen = set()
 
-        # Include memory-only agents (not yet persisted to DB)
-        for agent_id, mem_agent in self._agents.items():
-            if agent_id not in db_states:
+        if tenant_id:
+            # Scoped to single tenant
+            tenant_agents = self._tenant_agents.get(tenant_id, {})
+            for key, a in db_states.items():
+                if key[0] != tenant_id:
+                    continue
+                mem_agent = tenant_agents.get(a.agent_id)
                 states.append({
-                    "agent_id": mem_agent.agent_id,
-                    "status": mem_agent.status,
-                    "current_task": mem_agent.current_task,
-                    "model": mem_agent.model,
-                    "provider": mem_agent.provider_name,
-                    "parent_agent_id": None,
+                    "agent_id": a.agent_id,
+                    "status": mem_agent.status if mem_agent else a.status,
+                    "current_task": mem_agent.current_task if mem_agent else a.current_task,
+                    "model": mem_agent.model if mem_agent else a.model,
+                    "provider": mem_agent.provider_name if mem_agent else a.provider,
+                    "parent_agent_id": a.parent_agent_id,
+                    "ephemeral": getattr(a, 'ephemeral', False),
                 })
+                seen.add(a.agent_id)
+
+            for agent_id, mem_agent in tenant_agents.items():
+                if agent_id not in seen:
+                    states.append({
+                        "agent_id": mem_agent.agent_id,
+                        "status": mem_agent.status,
+                        "current_task": mem_agent.current_task,
+                        "model": mem_agent.model,
+                        "provider": mem_agent.provider_name,
+                        "parent_agent_id": None,
+                        "ephemeral": False,
+                    })
+        else:
+            # All tenants (backward compat)
+            for (tid, agent_id), a in db_states.items():
+                mem_agent = self._agents.get(agent_id)
+                states.append({
+                    "agent_id": a.agent_id,
+                    "status": mem_agent.status if mem_agent else a.status,
+                    "current_task": mem_agent.current_task if mem_agent else a.current_task,
+                    "model": mem_agent.model if mem_agent else a.model,
+                    "provider": mem_agent.provider_name if mem_agent else a.provider,
+                    "parent_agent_id": a.parent_agent_id,
+                    "tenant_id": tid,
+                    "ephemeral": getattr(a, 'ephemeral', False),
+                })
+                seen.add(agent_id)
 
         return states
 

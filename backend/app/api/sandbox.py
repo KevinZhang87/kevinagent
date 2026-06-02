@@ -1,14 +1,16 @@
 """Sandbox status API endpoints."""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from app.sandbox.manager import get_sandbox_manager
 from app.sandbox.cleaner import get_workspace_cleaner
+from app.auth.dependencies import get_current_tenant
+from app.auth.schema import TenantContext
 
 router = APIRouter(prefix="/api/sandbox", tags=["sandbox"])
 
 
 @router.get("/status")
-async def sandbox_status():
+async def sandbox_status(ctx: TenantContext = Depends(get_current_tenant)):
     """Get current sandbox status and configuration."""
     sandbox = get_sandbox_manager()
     config = sandbox.config
@@ -29,7 +31,7 @@ async def sandbox_status():
 
 
 @router.post("/test")
-async def sandbox_test():
+async def sandbox_test(ctx: TenantContext = Depends(get_current_tenant)):
     """Run a simple test command in the sandbox to verify it works."""
     sandbox = get_sandbox_manager()
 
@@ -58,15 +60,15 @@ async def sandbox_test():
 
 
 @router.get("/workspaces")
-async def workspace_stats():
-    """Get disk usage stats for all agent workspaces."""
+async def workspace_stats(ctx: TenantContext = Depends(get_current_tenant)):
+    """Get disk usage stats for agent workspaces."""
     cleaner = get_workspace_cleaner()
-    return cleaner.get_workspace_stats()
+    return cleaner.get_workspace_stats(tenant_id=ctx.tenant_id)
 
 
 @router.post("/workspaces/cleanup")
-async def workspace_cleanup():
+async def workspace_cleanup(ctx: TenantContext = Depends(get_current_tenant)):
     """Manually trigger workspace cleanup (TTL + size-based)."""
     cleaner = get_workspace_cleaner()
-    stats = cleaner.run_once()
+    stats = cleaner.run_once(tenant_id=ctx.tenant_id)
     return stats

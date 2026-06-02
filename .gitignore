@@ -56,3 +56,6 @@ backend/temp/
 
 # Claude Code settings (may contain local paths)
 .claude/
+
+# Continue extension config
+.continue/

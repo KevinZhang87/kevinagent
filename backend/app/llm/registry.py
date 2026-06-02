@@ -18,6 +18,11 @@ def get_provider(provider_name: str = "", model: str = "", api_key: str = "") ->
     provider_name = provider_name or cfg.default_provider
     model = model or cfg.default_model
 
+    # Normalize model name: strip "provider/" prefix if present
+    # e.g. "deepseek/deepseek-v4-flash" -> "deepseek-v4-flash"
+    if "/" in model:
+        model = model.split("/", 1)[1]
+
     if not provider_name:
         raise ValueError("No provider configured. Please configure a provider in Settings.")
 

@@ -33,6 +33,10 @@ class AgentCreate(BaseModel):
     provider: str = ""
     parent_agent_id: Optional[str] = None
     task: Optional[str] = None
+    system_prompt: Optional[str] = None
+    description: Optional[str] = None
+    capabilities: Optional[list[str]] = None
+    tools: Optional[list[str]] = None  # tool whitelist
 
 
 class AgentResponse(BaseModel):
@@ -55,6 +59,7 @@ class AgentNode(BaseModel):
     position: dict = {"x": 0, "y": 0}
     provider: str = ""
     parent_agent_id: Optional[str] = None
+    ephemeral: bool = False
 
 
 class AgentEdge(BaseModel):

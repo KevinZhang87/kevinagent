@@ -87,16 +87,24 @@ class SandboxManager:
 
         self._initialized = True
 
-    def get_agent_sandbox(self, agent_id: str) -> Optional[BaseSandbox]:
-        """Get or create a sandbox with isolated workspace for a specific agent."""
+    def get_agent_sandbox(self, agent_id: str, tenant_id: str = None) -> Optional[BaseSandbox]:
+        """Get or create a sandbox with isolated workspace for a specific agent.
+
+        With tenant_id: workspaces/{tenant_id}/{agent_id}/sandbox/
+        Without tenant_id: workspaces/{agent_id}/sandbox/ (backward compat)
+        """
         if not self.config.enabled:
             return None
 
-        if agent_id in self._agent_sandboxes:
-            return self._agent_sandboxes[agent_id]
+        cache_key = f"{tenant_id}:{agent_id}" if tenant_id else agent_id
+        if cache_key in self._agent_sandboxes:
+            return self._agent_sandboxes[cache_key]
 
-        # Create agent-specific workspace: workspaces/{agent_id}/sandbox/
-        agent_workspace = os.path.join(WORKSPACES_BASE, agent_id, "sandbox")
+        # Create agent-specific workspace with tenant isolation
+        if tenant_id:
+            agent_workspace = os.path.join(WORKSPACES_BASE, tenant_id, agent_id, "sandbox")
+        else:
+            agent_workspace = os.path.join(WORKSPACES_BASE, agent_id, "sandbox")
         os.makedirs(agent_workspace, exist_ok=True)
 
         # Create a config with the agent's workspace
@@ -121,8 +129,8 @@ class SandboxManager:
         else:
             sandbox = LocalSandbox(agent_config)
 
-        self._agent_sandboxes[agent_id] = sandbox
-        logger.info("Created sandbox for agent '%s' with workspace: %s", agent_id, agent_workspace)
+        self._agent_sandboxes[cache_key] = sandbox
+        logger.info("Created sandbox for agent '%s' (tenant=%s) with workspace: %s", agent_id, tenant_id, agent_workspace)
         return sandbox
 
     @property
@@ -135,17 +143,18 @@ class SandboxManager:
         """Check if sandbox is enabled and active."""
         return self._sandbox is not None
 
-    async def execute_command(self, command: str, timeout: int = 30, agent_id: str = None) -> SandboxResult:
+    async def execute_command(self, command: str, timeout: int = 30, agent_id: str = None, tenant_id: str = None) -> SandboxResult:
         """Execute a shell command through the sandbox.
 
         Args:
             command: Shell command to execute
             timeout: Timeout in seconds
             agent_id: Optional agent ID for isolated workspace
+            tenant_id: Optional tenant ID for tenant-scoped workspace
         """
         # Use agent-specific sandbox if agent_id provided
         if agent_id:
-            agent_sandbox = self.get_agent_sandbox(agent_id)
+            agent_sandbox = self.get_agent_sandbox(agent_id, tenant_id=tenant_id)
             if agent_sandbox:
                 return await agent_sandbox.execute_command(command, timeout)
 
@@ -155,17 +164,18 @@ class SandboxManager:
 
         return await self._sandbox.execute_command(command, timeout)
 
-    async def execute_python(self, code: str, timeout: int = 30, agent_id: str = None) -> SandboxResult:
+    async def execute_python(self, code: str, timeout: int = 30, agent_id: str = None, tenant_id: str = None) -> SandboxResult:
         """Execute Python code through the sandbox.
 
         Args:
             code: Python code to execute
             timeout: Timeout in seconds
             agent_id: Optional agent ID for isolated workspace
+            tenant_id: Optional tenant ID for tenant-scoped workspace
         """
         # Use agent-specific sandbox if agent_id provided
         if agent_id:
-            agent_sandbox = self.get_agent_sandbox(agent_id)
+            agent_sandbox = self.get_agent_sandbox(agent_id, tenant_id=tenant_id)
             if agent_sandbox:
                 return await agent_sandbox.execute_python(code, timeout)
 
@@ -175,16 +185,17 @@ class SandboxManager:
 
         return await self._sandbox.execute_python(code, timeout)
 
-    async def read_file(self, path: str, agent_id: str = None) -> SandboxResult:
+    async def read_file(self, path: str, agent_id: str = None, tenant_id: str = None) -> SandboxResult:
         """Read a file through the sandbox.
 
         Args:
             path: File path to read
             agent_id: Optional agent ID for isolated workspace
+            tenant_id: Optional tenant ID for tenant-scoped workspace
         """
         # Use agent-specific sandbox if agent_id provided
         if agent_id:
-            agent_sandbox = self.get_agent_sandbox(agent_id)
+            agent_sandbox = self.get_agent_sandbox(agent_id, tenant_id=tenant_id)
             if agent_sandbox:
                 return await agent_sandbox.read_file(path)
 
@@ -199,17 +210,18 @@ class SandboxManager:
 
         return await self._sandbox.read_file(path)
 
-    async def write_file(self, path: str, content: str, agent_id: str = None) -> SandboxResult:
+    async def write_file(self, path: str, content: str, agent_id: str = None, tenant_id: str = None) -> SandboxResult:
         """Write a file through the sandbox.
 
         Args:
             path: File path to write
             content: Content to write
             agent_id: Optional agent ID for isolated workspace
+            tenant_id: Optional tenant ID for tenant-scoped workspace
         """
         # Use agent-specific sandbox if agent_id provided
         if agent_id:
-            agent_sandbox = self.get_agent_sandbox(agent_id)
+            agent_sandbox = self.get_agent_sandbox(agent_id, tenant_id=tenant_id)
             if agent_sandbox:
                 return await agent_sandbox.write_file(path, content)
 
@@ -303,37 +315,47 @@ def get_sandbox_manager() -> "SandboxManager":
     return _sandbox_manager
 
 
-def init_agent_workspace(agent_id: str) -> str:
+def init_agent_workspace(agent_id: str, tenant_id: str = None) -> str:
     """Initialize workspace directory structure for an agent.
 
-    Creates:
-        workspaces/{agent_id}/
-        workspaces/{agent_id}/sandbox/    # For code execution
-        workspaces/{agent_id}/skills/     # For agent-specific skills
+    With tenant_id: workspaces/{tenant_id}/{agent_id}/sandbox/ and skills/
+    Without tenant_id: workspaces/{agent_id}/sandbox/ and skills/ (backward compat)
 
-    Also ensures shared_workspace/ exists for inter-agent collaboration.
+    Also ensures tenant-scoped shared_workspace exists.
 
     Returns:
         Path to the agent's workspace root
     """
-    workspace_root = os.path.join(WORKSPACES_BASE, agent_id)
+    if tenant_id:
+        workspace_root = os.path.join(WORKSPACES_BASE, tenant_id, agent_id)
+        shared_ws = os.path.join(WORKSPACES_BASE, tenant_id, "shared_workspace")
+    else:
+        workspace_root = os.path.join(WORKSPACES_BASE, agent_id)
+        shared_ws = SHARED_WORKSPACE
+
     sandbox_dir = os.path.join(workspace_root, "sandbox")
     skills_dir = os.path.join(workspace_root, "skills")
 
     os.makedirs(sandbox_dir, exist_ok=True)
     os.makedirs(skills_dir, exist_ok=True)
+    os.makedirs(shared_ws, exist_ok=True)
 
-    # Ensure shared workspace exists
-    os.makedirs(SHARED_WORKSPACE, exist_ok=True)
-
-    logger.info("Initialized workspace for agent '%s': %s", agent_id, workspace_root)
+    logger.info("Initialized workspace for agent '%s' (tenant=%s): %s", agent_id, tenant_id, workspace_root)
     return workspace_root
 
 
-def get_shared_workspace() -> str:
-    """Get the shared workspace path, creating it if needed."""
-    os.makedirs(SHARED_WORKSPACE, exist_ok=True)
-    return SHARED_WORKSPACE
+def get_shared_workspace(tenant_id: str = None) -> str:
+    """Get the shared workspace path, creating it if needed.
+
+    With tenant_id: workspaces/{tenant_id}/shared_workspace/
+    Without tenant_id: shared_workspace/ (backward compat)
+    """
+    if tenant_id:
+        path = os.path.join(WORKSPACES_BASE, tenant_id, "shared_workspace")
+    else:
+        path = SHARED_WORKSPACE
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def reset_sandbox_manager():

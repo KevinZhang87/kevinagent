@@ -18,16 +18,21 @@ WORKSPACES_BASE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(_
 class SkillManager:
     """Manages skills - creation, storage, retrieval, and evolution."""
 
-    def __init__(self, agent_id: str = None):
-        """Initialize SkillManager, optionally scoped to a specific agent.
+    def __init__(self, agent_id: str = None, tenant_id: str = None):
+        """Initialize SkillManager, optionally scoped to a specific agent and tenant.
 
         Args:
-            agent_id: If provided, skills are stored in workspaces/{agent_id}/skills/
+            agent_id: If provided, skills are stored in workspaces/{tenant_id}/{agent_id}/skills/
+            tenant_id: If provided, skills are scoped to this tenant in the database
         """
         self.agent_id = agent_id
+        self.tenant_id = tenant_id
         self._skills_dir = None
         if agent_id:
-            self._skills_dir = os.path.join(WORKSPACES_BASE, agent_id, "skills")
+            if tenant_id:
+                self._skills_dir = os.path.join(WORKSPACES_BASE, tenant_id, agent_id, "skills")
+            else:
+                self._skills_dir = os.path.join(WORKSPACES_BASE, agent_id, "skills")
             os.makedirs(self._skills_dir, exist_ok=True)
 
     def _get_skill_file_path(self, name: str) -> str:
@@ -61,14 +66,16 @@ class SkillManager:
 
     async def create_skill(self, name: str, description: str, instruction: str) -> dict:
         async with async_session() as session:
-            # Check for duplicate name
-            result = await session.execute(
-                select(Skill).where(Skill.name == name)
-            )
+            # Check for duplicate name within tenant
+            query = select(Skill).where(Skill.name == name)
+            if self.tenant_id:
+                query = query.where(Skill.tenant_id == self.tenant_id)
+            result = await session.execute(query)
             if result.scalar_one_or_none():
                 raise ValueError(f"Skill '{name}' already exists")
 
             skill = Skill(
+                tenant_id=self.tenant_id or "default",
                 name=name,
                 description=description,
                 instruction=instruction,
@@ -95,9 +102,10 @@ class SkillManager:
 
     async def get_skill(self, name: str) -> Optional[dict]:
         async with async_session() as session:
-            result = await session.execute(
-                select(Skill).where(Skill.name == name, Skill.is_active == True)
-            )
+            query = select(Skill).where(Skill.name == name, Skill.is_active == True)
+            if self.tenant_id:
+                query = query.where(Skill.tenant_id == self.tenant_id)
+            result = await session.execute(query)
             skill = result.scalar_one_or_none()
             if not skill:
                 return None
@@ -117,6 +125,8 @@ class SkillManager:
     async def list_skills(self, include_inactive: bool = False) -> list[dict]:
         async with async_session() as session:
             query = select(Skill)
+            if self.tenant_id:
+                query = query.where(Skill.tenant_id == self.tenant_id)
             if not include_inactive:
                 query = query.where(Skill.is_active == True)
             result = await session.execute(
@@ -140,9 +150,10 @@ class SkillManager:
 
     async def update_skill(self, name: str, description: Optional[str] = None, instruction: Optional[str] = None, is_active: Optional[bool] = None) -> bool:
         async with async_session() as session:
-            result = await session.execute(
-                select(Skill).where(Skill.name == name)
-            )
+            query = select(Skill).where(Skill.name == name)
+            if self.tenant_id:
+                query = query.where(Skill.tenant_id == self.tenant_id)
+            result = await session.execute(query)
             skill = result.scalar_one_or_none()
             if not skill:
                 return False
@@ -181,9 +192,10 @@ class SkillManager:
             context: Optional dict with 'user_query', 'skill_output', 'error' for failure analysis
         """
         async with async_session() as session:
-            result = await session.execute(
-                select(Skill).where(Skill.name == name)
-            )
+            query = select(Skill).where(Skill.name == name)
+            if self.tenant_id:
+                query = query.where(Skill.tenant_id == self.tenant_id)
+            result = await session.execute(query)
             skill = result.scalar_one_or_none()
             if skill:
                 if success:

@@ -52,7 +52,7 @@ class ToolRegistry:
     def get_all_names(self) -> list[str]:
         return list(self._tools.keys())
 
-    async def execute(self, name: str, arguments: dict, agent_id: str = None, on_progress=None, caller_session_id: str = "") -> ToolResult:
+    async def execute(self, name: str, arguments: dict, agent_id: str = None, on_progress=None, caller_session_id: str = "", tenant_id: str = None) -> ToolResult:
         tool = self.get(name)
         if not tool:
             return ToolResult(success=False, output="", error=f"Unknown tool: {name}")
@@ -62,6 +62,9 @@ class ToolRegistry:
             kwargs = dict(arguments)
             if "agent_id" not in kwargs and agent_id:
                 kwargs["agent_id"] = agent_id
+            # Pass tenant_id for tenant-scoped sandbox/workspace isolation
+            if tenant_id and "tenant_id" not in kwargs:
+                kwargs["tenant_id"] = tenant_id
             # Pass on_progress callback for tools that support streaming (e.g. call_agent)
             if on_progress:
                 kwargs["on_progress"] = on_progress
@@ -88,10 +91,10 @@ class ShellTool(BaseTool):
     def __init__(self, registry: ToolRegistry):
         self._registry = registry
 
-    async def execute(self, command: str = "", agent_id: str = None, **kwargs) -> ToolResult:
+    async def execute(self, command: str = "", agent_id: str = None, tenant_id: str = None, **kwargs) -> ToolResult:
         try:
             sandbox = await self._registry._ensure_sandbox()
-            result = await sandbox.execute_command(command, timeout=30, agent_id=agent_id)
+            result = await sandbox.execute_command(command, timeout=30, agent_id=agent_id, tenant_id=tenant_id)
             return ToolResult(
                 success=result.success,
                 output=result.output,
@@ -116,10 +119,10 @@ class FileReadTool(BaseTool):
     def __init__(self, registry: ToolRegistry):
         self._registry = registry
 
-    async def execute(self, path: str = "", agent_id: str = None, **kwargs) -> ToolResult:
+    async def execute(self, path: str = "", agent_id: str = None, tenant_id: str = None, **kwargs) -> ToolResult:
         try:
             sandbox = await self._registry._ensure_sandbox()
-            result = await sandbox.read_file(path, agent_id=agent_id)
+            result = await sandbox.read_file(path, agent_id=agent_id, tenant_id=tenant_id)
             return ToolResult(
                 success=result.success,
                 output=result.output,
@@ -145,10 +148,10 @@ class FileWriteTool(BaseTool):
     def __init__(self, registry: ToolRegistry):
         self._registry = registry
 
-    async def execute(self, path: str = "", content: str = "", agent_id: str = None, **kwargs) -> ToolResult:
+    async def execute(self, path: str = "", content: str = "", agent_id: str = None, tenant_id: str = None, **kwargs) -> ToolResult:
         try:
             sandbox = await self._registry._ensure_sandbox()
-            result = await sandbox.write_file(path, content, agent_id=agent_id)
+            result = await sandbox.write_file(path, content, agent_id=agent_id, tenant_id=tenant_id)
             return ToolResult(
                 success=result.success,
                 output=result.output,
@@ -209,10 +212,10 @@ class PythonExecTool(BaseTool):
     def __init__(self, registry: ToolRegistry):
         self._registry = registry
 
-    async def execute(self, code: str = "", agent_id: str = None, **kwargs) -> ToolResult:
+    async def execute(self, code: str = "", agent_id: str = None, tenant_id: str = None, **kwargs) -> ToolResult:
         try:
             sandbox = await self._registry._ensure_sandbox()
-            result = await sandbox.execute_python(code, timeout=30, agent_id=agent_id)
+            result = await sandbox.execute_python(code, timeout=30, agent_id=agent_id, tenant_id=tenant_id)
             return ToolResult(
                 success=result.success,
                 output=result.output,
@@ -253,38 +256,101 @@ class CallAgentTool(BaseTool):
         "required": ["agent_id", "message"],
     }
 
-    async def execute(self, agent_id: str = "", message: str = "", on_progress=None, caller_session_id: str = "", **kwargs) -> ToolResult:
+    async def execute(self, agent_id: str = "", message: str = "", on_progress=None, caller_session_id: str = "", tenant_id: str = None, **kwargs) -> ToolResult:
         try:
             from app.core.agent import agent_manager
 
             if not agent_id or not message:
                 return ToolResult(success=False, output="", error="Both agent_id and message are required")
 
-            agent = agent_manager.get_agent(agent_id)
+            # Look up agent within the same tenant
+            agent = agent_manager.get_agent(agent_id, tenant_id=tenant_id)
             if not agent:
-                # Try to auto-create from database
-                logger.info("call_agent: agent '%s' not in memory, attempting auto-creation", agent_id)
+                # Try to auto-create from database (scoped to tenant)
+                logger.info("call_agent: agent '%s' not in memory, attempting auto-creation (tenant=%s)", agent_id, tenant_id)
                 from app.models.database import AgentState, async_session
                 from sqlalchemy import select as sel
                 async with async_session() as session:
-                    result = await session.execute(
-                        sel(AgentState).where(AgentState.agent_id == agent_id)
-                    )
+                    query = sel(AgentState).where(AgentState.agent_id == agent_id)
+                    if tenant_id:
+                        query = query.where(AgentState.tenant_id == tenant_id)
+                    result = await session.execute(query)
                     state = result.scalar_one_or_none()
                 if state:
+                    # For agents defined in agent_config.json, always use current
+                    # default provider/model (config empty = "use default").
+                    # Only use DB values for user-created agents not in config.
+                    import app.config as _cfg
+                    config_cfg = None
+                    try:
+                        from pathlib import Path
+                        _cp = Path(__file__).parent.parent.parent / "agent_config.json"
+                        if _cp.exists():
+                            with open(_cp, "r", encoding="utf-8") as _f:
+                                config_cfg = json.load(_f).get("agents", {}).get(agent_id)
+                    except Exception:
+                        pass
+                    # Use config defaults for config-defined agents, DB values for user-created
+                    use_provider = _cfg.default_provider if config_cfg else state.provider
+                    use_model = _cfg.default_model if config_cfg else state.model
                     agent = await agent_manager.create_agent(
                         agent_id=state.agent_id,
-                        provider=state.provider,
-                        model=state.model,
-                        session_id=caller_session_id,  # Share parent's session
+                        provider=use_provider,
+                        model=use_model,
+                        session_id=caller_session_id,
+                        system_prompt=state.system_prompt or "",
+                        tenant_id=tenant_id or "default",
+                        ephemeral=getattr(state, 'ephemeral', False),
+                        tools=json.loads(state.tools) if state.tools else None,
                     )
                 else:
-                    available = list(agent_manager._agents.keys())
-                    return ToolResult(
-                        success=False,
-                        output="",
-                        error=f"Agent '{agent_id}' not found. Available agents: {available}",
-                    )
+                    # Try to auto-create from agent_config.json
+                    config_agent_cfg = None
+                    try:
+                        from pathlib import Path
+                        config_path = Path(__file__).parent.parent.parent / "agent_config.json"
+                        if config_path.exists():
+                            with open(config_path, "r", encoding="utf-8") as f:
+                                cfg = json.load(f)
+                            config_agent_cfg = cfg.get("agents", {}).get(agent_id)
+                    except Exception:
+                        pass
+
+                    if config_agent_cfg:
+                        logger.info("call_agent: auto-creating '%s' from agent_config.json", agent_id)
+                        import app.config as _cfg
+                        agent = await agent_manager.create_agent(
+                            agent_id=agent_id,
+                            provider=config_agent_cfg.get("provider") or _cfg.default_provider,
+                            model=config_agent_cfg.get("model") or _cfg.default_model,
+                            session_id=caller_session_id,
+                            parent_agent_id=caller_agent_id or "main",
+                            system_prompt=config_agent_cfg.get("system_prompt", ""),
+                            tenant_id=tenant_id or "default",
+                            ephemeral=True,
+                            description=config_agent_cfg.get("description", ""),
+                            capabilities=config_agent_cfg.get("capabilities"),
+                            tools=config_agent_cfg.get("tools"),
+                        )
+                    else:
+                        available = list(agent_manager.get_tenant_agents(tenant_id or "default").keys()) if tenant_id else list(agent_manager._agents.keys())
+                        # Also list agents from config
+                        config_agents = []
+                        try:
+                            from pathlib import Path
+                            config_path = Path(__file__).parent.parent.parent / "agent_config.json"
+                            if config_path.exists():
+                                with open(config_path, "r", encoding="utf-8") as f:
+                                    cfg = json.load(f)
+                                config_agents = list(cfg.get("agents", {}).keys())
+                        except Exception:
+                            pass
+                        all_available = list(set(available + config_agents))
+                        return ToolResult(
+                            success=False,
+                            output="",
+                            error=f"Agent '{agent_id}' not found. Available agents: {all_available}",
+                        )
 
             # If sub-agent has no custom system_prompt, prepend role context to message
             effective_message = message
@@ -355,15 +421,15 @@ class CreateAgentTool(BaseTool):
         "required": ["agent_id"],
     }
 
-    async def execute(self, agent_id: str = "", model: str = "", provider: str = "", **_kwargs) -> ToolResult:
+    async def execute(self, agent_id: str = "", model: str = "", provider: str = "", tenant_id: str = None, caller_agent_id: str = "", **_kwargs) -> ToolResult:
         try:
             from app.core.agent import agent_manager
 
             if not agent_id:
                 return ToolResult(success=False, output="", error="agent_id is required")
 
-            # Check if agent already exists
-            existing = agent_manager.get_agent(agent_id)
+            # Check if agent already exists within this tenant
+            existing = agent_manager.get_agent(agent_id, tenant_id=tenant_id)
             if existing:
                 return ToolResult(
                     success=True,
@@ -371,7 +437,6 @@ class CreateAgentTool(BaseTool):
                 )
 
             # Limit dynamic agent creation to prevent runaway spawning
-            # Count non-pre-created agents (agents not in agent_config.json)
             try:
                 import json
                 from pathlib import Path
@@ -381,29 +446,32 @@ class CreateAgentTool(BaseTool):
                     with open(config_path, "r", encoding="utf-8") as f:
                         cfg = json.load(f)
                     pre_created_ids = set(cfg.get("agents", {}).keys())
-                dynamic_count = sum(1 for aid in agent_manager._agents.keys() if aid not in pre_created_ids and aid != "main")
+                tenant_agents = agent_manager.get_tenant_agents(tenant_id or "default")
+                dynamic_count = sum(1 for aid in tenant_agents.keys() if aid not in pre_created_ids and aid != "main")
                 if dynamic_count >= 3:
                     return ToolResult(
                         success=False,
                         output="",
-                        error=f"Dynamic agent limit reached (3). Existing dynamic agents: {[aid for aid in agent_manager._agents.keys() if aid not in pre_created_ids and aid != 'main']}",
+                        error=f"Dynamic agent limit reached (3). Existing dynamic agents: {[aid for aid in tenant_agents.keys() if aid not in pre_created_ids and aid != 'main']}",
                     )
             except Exception:
                 pass
 
             # Use defaults if not specified
+            import app.config as _cfg
             if not provider:
-                from app.config import default_provider
-                provider = default_provider
+                provider = _cfg.default_provider
             if not model:
-                from app.config import default_model
-                model = default_model
+                model = _cfg.default_model
 
-            # Create the agent
+            # Create the agent within the tenant
             await agent_manager.create_agent(
                 agent_id=agent_id,
                 provider=provider,
                 model=model,
+                parent_agent_id=caller_agent_id or "main",
+                ephemeral=True,
+                tenant_id=tenant_id or "default",
             )
 
             return ToolResult(
@@ -423,12 +491,16 @@ class ListAgentsTool(BaseTool):
         "properties": {},
     }
 
-    async def execute(self, **_kwargs) -> ToolResult:
+    async def execute(self, tenant_id: str = None, **_kwargs) -> ToolResult:
         try:
             from app.core.agent import agent_manager
 
             agents = []
-            for agent_id, agent in agent_manager._agents.items():
+            if tenant_id:
+                tenant_agents = agent_manager.get_tenant_agents(tenant_id)
+            else:
+                tenant_agents = agent_manager._agents
+            for agent_id, agent in tenant_agents.items():
                 agents.append({
                     "agent_id": agent_id,
                     "model": agent.model,
@@ -460,12 +532,12 @@ class SharedReadTool(BaseTool):
         "required": ["path"],
     }
 
-    async def execute(self, path: str = "", **_kwargs) -> ToolResult:
+    async def execute(self, path: str = "", tenant_id: str = None, **_kwargs) -> ToolResult:
         try:
             from app.sandbox.manager import get_shared_workspace
             import os
 
-            shared_dir = get_shared_workspace()
+            shared_dir = get_shared_workspace(tenant_id=tenant_id)
             # Prevent path traversal
             full_path = os.path.normpath(os.path.join(shared_dir, path))
             if not full_path.startswith(shared_dir):
@@ -485,7 +557,7 @@ class SharedReadTool(BaseTool):
 
 class SharedWriteTool(BaseTool):
     name = "shared_write"
-    description = "Write a file to the shared workspace (accessible by all agents)."
+    description = "Write a file to the shared workspace (accessible by all agents in your workspace)."
     parameters = {
         "type": "object",
         "properties": {
@@ -495,12 +567,12 @@ class SharedWriteTool(BaseTool):
         "required": ["path", "content"],
     }
 
-    async def execute(self, path: str = "", content: str = "", **_kwargs) -> ToolResult:
+    async def execute(self, path: str = "", content: str = "", tenant_id: str = None, **_kwargs) -> ToolResult:
         try:
             from app.sandbox.manager import get_shared_workspace
             import os
 
-            shared_dir = get_shared_workspace()
+            shared_dir = get_shared_workspace(tenant_id=tenant_id)
             # Prevent path traversal
             full_path = os.path.normpath(os.path.join(shared_dir, path))
             if not full_path.startswith(shared_dir):
@@ -528,12 +600,12 @@ class SharedListTool(BaseTool):
         },
     }
 
-    async def execute(self, path: str = "", **_kwargs) -> ToolResult:
+    async def execute(self, path: str = "", tenant_id: str = None, **_kwargs) -> ToolResult:
         try:
             from app.sandbox.manager import get_shared_workspace
             import os
 
-            shared_dir = get_shared_workspace()
+            shared_dir = get_shared_workspace(tenant_id=tenant_id)
             target_dir = os.path.normpath(os.path.join(shared_dir, path))
             if not target_dir.startswith(shared_dir):
                 return ToolResult(success=False, output="", error="Path traversal not allowed")

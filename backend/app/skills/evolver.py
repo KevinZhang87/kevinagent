@@ -40,6 +40,9 @@ def _extract_json(text: str) -> Optional[dict]:
 class SkillEvolver:
     """Handles skill evolution - improving skills based on usage patterns."""
 
+    def __init__(self, tenant_id: str = None):
+        self.tenant_id = tenant_id
+
     def _get_threshold(self) -> int:
         """Get the evolve threshold from config (auto_evolve) or default."""
         try:
@@ -54,9 +57,10 @@ class SkillEvolver:
         real examples of what went wrong, enabling targeted improvements.
         """
         async with async_session() as session:
-            result = await session.execute(
-                select(Skill).where(Skill.name == skill_name)
-            )
+            query = select(Skill).where(Skill.name == skill_name)
+            if self.tenant_id:
+                query = query.where(Skill.tenant_id == self.tenant_id)
+            result = await session.execute(query)
             skill = result.scalar_one_or_none()
             if not skill:
                 return None
@@ -157,13 +161,14 @@ CRITICAL: Return ONLY a JSON object (no markdown, no explanation outside the JSO
         """
         threshold = self._get_threshold()
         async with async_session() as session:
-            result = await session.execute(
-                select(Skill).where(
-                    Skill.is_active == True,
-                    Skill.fail_count > threshold,
-                    Skill.fail_count > Skill.success_count,
-                )
+            query = select(Skill).where(
+                Skill.is_active == True,
+                Skill.fail_count > threshold,
+                Skill.fail_count > Skill.success_count,
             )
+            if self.tenant_id:
+                query = query.where(Skill.tenant_id == self.tenant_id)
+            result = await session.execute(query)
             skills = result.scalars().all()
 
             if not skills:

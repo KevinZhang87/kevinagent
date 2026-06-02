@@ -17,6 +17,8 @@ agent:
 active_providers:
 - deepseek
 - mimo
+memory:
+  backend: sqlite
 sandbox:
   enabled: true
   backend: auto

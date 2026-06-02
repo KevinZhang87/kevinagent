@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.models.database import init_db
 from app.api import chat, agents, skills, models, stats, user_settings, sandbox, tasks, memory
+from app.auth.router import router as auth_router
 from app.config import app_config
 
 # Configure structured logging
@@ -48,6 +49,22 @@ async def lifespan(app: FastAPI):
     agent_manager.add_ws_callback(ws_manager.send_agent_update)
     logger.info("WebSocket agent broadcast wired")
 
+    # Reset stale agent states from previous crash/restart
+    from app.models.database import async_session, AgentState
+    from sqlalchemy import update as sql_update
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                sql_update(AgentState).where(
+                    AgentState.status.in_(["thinking", "executing", "cancelled"])
+                ).values(status="idle", current_task="")
+            )
+            await session.commit()
+            if result.rowcount > 0:
+                logger.info("Reset %d stale agent states to idle", result.rowcount)
+    except Exception as e:
+        logger.warning("Failed to reset stale agent states: %s", e)
+
     # Load agent_config.json and pre-create configured agents
     agent_config_path = Path(__file__).parent.parent / "agent_config.json"
     if agent_config_path.exists():
@@ -64,6 +81,7 @@ async def lifespan(app: FastAPI):
                     provider=provider,
                     model=model,
                     system_prompt=agent_data.get("system_prompt", ""),
+                    tenant_id="default",
                 )
                 logger.info("Pre-created agent from config: %s (%s/%s)", agent_id, provider, model)
         except Exception as e:
@@ -97,6 +115,7 @@ app.add_middleware(
 )
 
 # Include routers
+app.include_router(auth_router)
 app.include_router(chat.router)
 app.include_router(agents.router)
 app.include_router(skills.router)

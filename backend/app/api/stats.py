@@ -1,9 +1,11 @@
 import logging
 from datetime import datetime, timedelta
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from sqlalchemy import select, func
 
 from app.models.database import TokenUsage, async_session
+from app.auth.dependencies import get_current_tenant
+from app.auth.schema import TenantContext
 
 logger = logging.getLogger("kevin_agent.stats")
 
@@ -11,12 +13,11 @@ router = APIRouter(prefix="/api/stats", tags=["stats"])
 
 
 @router.get("/tokens/debug")
-async def debug_token_usage():
+async def debug_token_usage(ctx: TenantContext = Depends(get_current_tenant)):
     """Debug endpoint: show recent raw token_usage records."""
     async with async_session() as session:
-        result = await session.execute(
-            select(TokenUsage).order_by(TokenUsage.created_at.desc()).limit(20)
-        )
+        query = select(TokenUsage).where(TokenUsage.tenant_id == ctx.tenant_id).order_by(TokenUsage.created_at.desc()).limit(20)
+        result = await session.execute(query)
         records = [
             {
                 "id": r.id,
@@ -34,14 +35,14 @@ async def debug_token_usage():
         ]
         # Also count total
         count_result = await session.execute(
-            select(func.count(TokenUsage.id))
+            select(func.count(TokenUsage.id)).where(TokenUsage.tenant_id == ctx.tenant_id)
         )
         total_count = count_result.scalar() or 0
         return {"total_records": total_count, "recent_records": records}
 
 
 @router.get("/tokens")
-async def get_token_stats(days: int = 30):
+async def get_token_stats(days: int = 30, ctx: TenantContext = Depends(get_current_tenant)):
     """Get token usage statistics aggregated by day."""
     since = datetime.utcnow() - timedelta(days=days)
 
@@ -56,7 +57,7 @@ async def get_token_stats(days: int = 30):
                 func.sum(TokenUsage.total_tokens).label("total_tokens"),
                 func.count(TokenUsage.id).label("request_count"),
             )
-            .where(TokenUsage.created_at >= since)
+            .where(TokenUsage.created_at >= since, TokenUsage.tenant_id == ctx.tenant_id)
             .group_by(date_expr)
             .order_by(date_expr)
         )
@@ -80,7 +81,7 @@ async def get_token_stats(days: int = 30):
                 func.sum(TokenUsage.total_tokens).label("total_tokens"),
                 func.count(TokenUsage.id).label("request_count"),
             )
-            .where(TokenUsage.created_at >= since)
+            .where(TokenUsage.created_at >= since, TokenUsage.tenant_id == ctx.tenant_id)
         )
         total_row = total_result.one()
 
@@ -91,7 +92,7 @@ async def get_token_stats(days: int = 30):
                 func.sum(TokenUsage.total_tokens).label("total_tokens"),
                 func.count(TokenUsage.id).label("request_count"),
             )
-            .where(TokenUsage.created_at >= since)
+            .where(TokenUsage.created_at >= since, TokenUsage.tenant_id == ctx.tenant_id)
             .group_by(TokenUsage.model)
             .order_by(func.sum(TokenUsage.total_tokens).desc())
         )
@@ -119,7 +120,7 @@ async def get_token_stats(days: int = 30):
 
 
 @router.get("/overview")
-async def get_overview():
+async def get_overview(ctx: TenantContext = Depends(get_current_tenant)):
     """Get a quick overview of system statistics."""
     async with async_session() as session:
         # Today's usage
@@ -129,7 +130,7 @@ async def get_overview():
                 func.sum(TokenUsage.total_tokens).label("total_tokens"),
                 func.count(TokenUsage.id).label("request_count"),
             )
-            .where(TokenUsage.created_at >= today)
+            .where(TokenUsage.created_at >= today, TokenUsage.tenant_id == ctx.tenant_id)
         )
         today_row = today_result.one()
 
@@ -139,6 +140,7 @@ async def get_overview():
                 func.sum(TokenUsage.total_tokens).label("total_tokens"),
                 func.count(TokenUsage.id).label("request_count"),
             )
+            .where(TokenUsage.tenant_id == ctx.tenant_id)
         )
         total_row = total_result.one()
 
@@ -149,7 +151,7 @@ async def get_overview():
                 func.sum(TokenUsage.total_tokens).label("total_tokens"),
                 func.count(TokenUsage.id).label("request_count"),
             )
-            .where(TokenUsage.created_at >= week_ago)
+            .where(TokenUsage.created_at >= week_ago, TokenUsage.tenant_id == ctx.tenant_id)
         )
         week_row = week_result.one()
 
@@ -170,13 +172,14 @@ async def get_overview():
 
 
 @router.get("/context")
-async def get_context_stats():
+async def get_context_stats(ctx: TenantContext = Depends(get_current_tenant)):
     """Get context window usage statistics for active agents."""
     from app.core.agent import agent_manager
     from app.config import app_config
 
     agents_info = []
-    for agent_id, agent in agent_manager._agents.items():
+    tenant_agents = agent_manager.get_tenant_agents(ctx.tenant_id)
+    for agent_id, agent in tenant_agents.items():
         agents_info.append({
             "agent_id": agent_id,
             "model": agent.model,
